@@ -112,4 +112,4 @@ node bridge.mjs logs
 
 ## License
 
-MIT
+No license. All rights reserved.
