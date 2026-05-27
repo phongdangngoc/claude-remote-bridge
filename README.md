@@ -8,6 +8,18 @@ Control Claude Code CLI from your phone via Telegram. Approve tool calls, pick m
 
 Single Node 14+ process, zero npm deps.
 
+## Platform support
+
+The bridge depends on `tmux`, POSIX named pipes (`mkfifo`), and `systemd` for the always-on user service. That maps to:
+
+| Platform | Status |
+|---|---|
+| Linux with systemd (Ubuntu, Debian, Fedora, Arch, …) | ✅ Full support — primary target |
+| Windows + WSL2 (Ubuntu) | ✅ Works the same as native Linux |
+| macOS | ⚠️ Daemon runs (`tmux` + `mkfifo` available), but `scripts/install.sh` does not — you'd need a `launchd` plist instead of the systemd unit |
+| Linux without systemd (Alpine, container, BSD, …) | ⚠️ Code runs, but you'll need your own process supervisor |
+| Windows (native, no WSL) | ❌ Unsupported — no `tmux`, no POSIX FIFO, no systemd |
+
 ## Setup (Linux, tested on Ubuntu)
 
 ```bash
