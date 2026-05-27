@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.config/
+state.json
+config.json
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

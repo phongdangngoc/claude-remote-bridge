@@ -1,0 +1,6 @@
+What's your preference for the auth strategy?
+
+❯ OAuth via SSO
+  API key
+  Session cookie
+

@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude Code Telegram Bridge
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=__NODE_PATH__ __BRIDGE_PATH__ daemon
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,7 @@
+
+Do you want to proceed with running this command?
+
+❯ 1. Yes
+  2. Yes, and allow all sessions
+  3. No (Esc)
+

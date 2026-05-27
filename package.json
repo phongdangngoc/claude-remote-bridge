@@ -1,0 +1,21 @@
+{
+  "name": "claude-remote-bridge",
+  "version": "0.1.0",
+  "description": "Telegram-driven remote bridge for Claude Code CLI",
+  "type": "module",
+  "main": "bridge.mjs",
+  "bin": {
+    "claude-bridge": "./bridge.mjs"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "scripts": {
+    "test": "node test/_runner.mjs test/parser.test.mjs test/streamer.test.mjs",
+    "start": "node bridge.mjs daemon"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "license": "UNLICENSED",
+  "private": true
+}
