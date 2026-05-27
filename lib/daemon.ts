@@ -1,3 +1,5 @@
+import path from 'path'
+import { spawn } from 'child_process'
 import { TelegramClient, isRateLimit, isInvalidToken, TelegramError } from './telegram.js'
 import * as tmux from './tmux.js'
 import * as fifo from './fifo.js'
@@ -11,6 +13,29 @@ type LogLevel = 'info' | 'warn' | 'error'
 
 function log(level: LogLevel, actor: string, msg: string): void {
     process.stderr.write(`[${level}] [${actor}] ${msg}\n`)
+}
+
+function gitBranch(cwd: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const child = spawn('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], { stdio: ['ignore', 'pipe', 'pipe'] })
+        let out = ''
+        child.stdout!.on('data', (d: Buffer) => out += d.toString())
+        child.on('error', reject)
+        child.on('close', (code) => code === 0 ? resolve(out.trim()) : reject(new Error(`git exit ${code}`)))
+    })
+}
+
+// Build the per-message header. Fails-soft: any missing piece is dropped.
+async function buildHeader(session: string, cwd: string | undefined): Promise<string> {
+    const parts = [`📡 \`${session}\``]
+    if (cwd) {
+        parts.push(`\`${path.basename(cwd)}\``)
+        try {
+            const branch = await gitBranch(cwd)
+            if (branch && branch !== 'HEAD') parts.push(`\`${branch}\``)
+        } catch {}
+    }
+    return parts.join(' · ')
 }
 
 export async function runDaemon(): Promise<void> {
@@ -52,9 +77,19 @@ export async function runDaemon(): Promise<void> {
         const stream = fifo.openReadStream(fifoPath)
         await tmux.pipePaneStart(sessionName, `cat > ${JSON.stringify(fifoPath)}`)
 
+        // Cache cwd at attach time. Header on every new send re-queries the
+        // git branch (cheap) but reuses the cached cwd.
+        let cachedCwd: string | undefined
+        try { cachedCwd = await tmux.paneCwd(sessionName) } catch (e) {
+            log('warn', 'tmux', `paneCwd failed: ${errMsg(e)}`)
+        }
+
         const sink: Sink = {
             sendNew: async (text: string) => {
-                const msg = await tg.sendMessage(config.chat_id, text)
+                let header = ''
+                try { header = await buildHeader(sessionName, cachedCwd) } catch {}
+                const body = header ? `${header}\n${text}` : text
+                const msg = await tg.sendMessage(config.chat_id, body)
                 return msg.message_id
             },
             edit: async (id: number, text: string) => {

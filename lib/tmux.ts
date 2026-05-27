@@ -93,3 +93,8 @@ export async function newSession(name: string, { cwd, command = 'claude' }: { cw
 export async function killSession(name: string): Promise<void> {
     await run(['kill-session', '-t', name])
 }
+
+export async function paneCwd(session: string): Promise<string> {
+    const out = await run(['display-message', '-p', '-t', session, '#{pane_current_path}'])
+    return out.trim()
+}
