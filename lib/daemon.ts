@@ -5,15 +5,12 @@ import { Streamer, Sink } from './streamer.js'
 import { detectPrompt, Option } from './parser.js'
 import { routeUpdate, BridgeState, Ctx } from './dispatcher.js'
 import { loadConfig, loadState, saveState, getFifoDir } from './config.js'
+import { errMsg } from './errors.js'
 
 type LogLevel = 'info' | 'warn' | 'error'
 
 function log(level: LogLevel, actor: string, msg: string): void {
     process.stderr.write(`[${level}] [${actor}] ${msg}\n`)
-}
-
-function errMsg(e: unknown): string {
-    return e instanceof Error ? e.message : String(e)
 }
 
 export async function runDaemon(): Promise<void> {

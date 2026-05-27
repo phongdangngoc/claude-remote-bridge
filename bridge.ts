@@ -6,6 +6,7 @@ import { TelegramClient } from './lib/telegram.js'
 import { loadConfig, saveConfig, loadState, getConfigPath, getStatePath, DEFAULTS, Config } from './lib/config.js'
 import { runDaemon } from './lib/daemon.js'
 import * as tmux from './lib/tmux.js'
+import { errMsg } from './lib/errors.js'
 
 function fail(msg: string, code = 1): never {
     process.stderr.write(`bridge: ${msg}\n`)
@@ -82,7 +83,7 @@ async function cmdStatus(): Promise<void> {
         const sd = spawnSync('systemctl', ['--user', 'is-active', 'claude-bridge.service'], { encoding: 'utf8' })
         info(`systemd status:   ${sd.stdout.trim() || 'unknown'}`)
     } catch (e) {
-        fail((e as Error).message)
+        fail(errMsg(e))
     }
 }
 
@@ -136,8 +137,7 @@ async function main(): Promise<void> {
                 fail(`Unknown command: ${sub}. Try: bridge help`)
         }
     } catch (e) {
-        const err = e as Error
-        fail(err.stack || err.message)
+        fail(e instanceof Error ? (e.stack || e.message) : errMsg(e))
     }
 }
 

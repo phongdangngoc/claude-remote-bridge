@@ -144,4 +144,4 @@ node dist/bridge.js logs
 
 ## License
 
-No license. All rights reserved.
+MIT — see [LICENSE](./LICENSE).

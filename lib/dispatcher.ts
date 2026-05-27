@@ -1,4 +1,5 @@
 import * as tmux from './tmux.js'
+import { errMsg } from './errors.js'
 import type { Streamer } from './streamer.js'
 import type { Config } from './config.js'
 import type { TelegramClient, TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from './telegram.js'
@@ -74,7 +75,7 @@ async function routeMessage(msg: TelegramMessage, ctx: Ctx): Promise<void> {
         await tmux.sendKeys(ctx.state.attached.session, text, { literal: true })
         await tmux.sendEnter(ctx.state.attached.session)
     } catch (e) {
-        await ctx.tg.sendMessage(ctx.chatId, `❌ send-keys failed: ${(e as Error).message}`)
+        await ctx.tg.sendMessage(ctx.chatId, `❌ send-keys failed: ${errMsg(e)}`)
     }
 }
 
@@ -139,7 +140,7 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
             await ctx.tg.answerCallbackQuery(cb.id, 'Unknown action')
         }
     } catch (e) {
-        await ctx.tg.answerCallbackQuery(cb.id, `Error: ${(e as Error).message}`.slice(0, 200))
+        await ctx.tg.answerCallbackQuery(cb.id, `Error: ${errMsg(e)}`.slice(0, 200))
     }
 }
 
@@ -203,7 +204,7 @@ async function cmdAttach(name: string | undefined, ctx: Ctx): Promise<void> {
         await ctx.attach(name)
         await ctx.tg.sendMessage(ctx.chatId, `📡 Attached to \`${name}\`. Send messages to chat with Claude.`)
     } catch (e) {
-        await ctx.tg.sendMessage(ctx.chatId, `❌ Attach failed: ${(e as Error).message}`)
+        await ctx.tg.sendMessage(ctx.chatId, `❌ Attach failed: ${errMsg(e)}`)
     }
 }
 
@@ -240,7 +241,7 @@ async function cmdNew(name: string | undefined, ctx: Ctx): Promise<void> {
         await ctx.tg.sendMessage(ctx.chatId, `🆕 Created \`${name}\`. Attaching...`)
         await ctx.attach(name)
     } catch (e) {
-        await ctx.tg.sendMessage(ctx.chatId, `❌ Create failed: ${(e as Error).message}`)
+        await ctx.tg.sendMessage(ctx.chatId, `❌ Create failed: ${errMsg(e)}`)
     }
 }
 

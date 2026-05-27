@@ -1,6 +1,7 @@
 import fs from 'fs/promises'
 import path from 'path'
 import os from 'os'
+import { errMsg } from './errors.js'
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'claude-bridge')
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
@@ -97,7 +98,7 @@ export async function loadState(): Promise<State> {
         return await readJson<State>(STATE_FILE)
     } catch (e) {
         if ((e as NodeJS.ErrnoException).code === 'ENOENT') return empty
-        process.stderr.write(`[warn] state.json corrupt: ${(e as Error).message}\n`)
+        process.stderr.write(`[warn] state.json corrupt: ${errMsg(e)}\n`)
         return empty
     }
 }
