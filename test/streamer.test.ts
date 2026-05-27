@@ -1,21 +1,33 @@
-import { test } from './_runner.mjs'
+import { test } from './_runner.js'
 import { strict as assert } from 'assert'
-import { Streamer } from '../lib/streamer.mjs'
+import { Streamer, Sink } from '../lib/streamer.js'
 
-function makeFakeClock() {
+interface FakeTimer {
+    cb: () => void | Promise<void>
+    fireAt: number
+    cancelled: boolean
+}
+
+interface FakeClock {
+    now: () => number
+    setTimer: (cb: () => void | Promise<void>, delay: number) => unknown
+    clearTimer: (t: unknown) => void
+    advance: (ms: number) => Promise<void>
+}
+
+function makeFakeClock(): FakeClock {
     let current = 0
-    const timers = []
+    const timers: FakeTimer[] = []
     return {
         now: () => current,
         setTimer: (cb, delay) => {
-            const t = { cb, fireAt: current + delay, cancelled: false }
+            const t: FakeTimer = { cb, fireAt: current + delay, cancelled: false }
             timers.push(t)
             return t
         },
-        clearTimer: (t) => { if (t) t.cancelled = true },
+        clearTimer: (t) => { if (t) (t as FakeTimer).cancelled = true },
         advance: async (ms) => {
             const target = current + ms
-            // Fire timers in order
             timers.sort((a, b) => a.fireAt - b.fireAt)
             for (const t of timers) {
                 if (t.cancelled) continue
@@ -30,19 +42,29 @@ function makeFakeClock() {
     }
 }
 
-function makeFakeSink() {
-    const events = []
+type FakeEvent =
+    | { type: 'sendNew'; id: number; text: string }
+    | { type: 'edit'; id: number; text: string }
+    | { type: 'silence'; buf: string }
+    | { type: 'error'; message: string }
+
+interface FakeSink extends Sink {
+    events: FakeEvent[]
+}
+
+function makeFakeSink(): FakeSink {
+    const events: FakeEvent[] = []
     let nextId = 100
     return {
         events,
-        sendNew: async (text) => {
+        sendNew: async (text: string) => {
             const id = nextId++
             events.push({ type: 'sendNew', id, text })
             return id
         },
-        edit: async (id, text) => { events.push({ type: 'edit', id, text }) },
-        onSilence: async (buf) => { events.push({ type: 'silence', buf }) },
-        onError: (e) => { events.push({ type: 'error', message: e.message }) },
+        edit: async (id: number, text: string) => { events.push({ type: 'edit', id, text }) },
+        onSilence: async (buf: string) => { events.push({ type: 'silence', buf }) },
+        onError: (e: Error) => { events.push({ type: 'error', message: e.message }) },
     }
 }
 
@@ -52,7 +74,7 @@ test('Streamer: first chunk sends new message after throttle wait', async () => 
     const s = new Streamer(sink, { silenceMs: 800, editThrottleMs: 1500, ...clock })
     s.push('hello')
     await clock.advance(1500)
-    const sends = sink.events.filter(e => e.type === 'sendNew')
+    const sends = sink.events.filter((e): e is Extract<FakeEvent, { type: 'sendNew' }> => e.type === 'sendNew')
     assert.equal(sends.length, 1)
     assert.match(sends[0].text, /hello/)
 })
@@ -87,7 +109,7 @@ test('Streamer: ANSI is stripped', async () => {
     const s = new Streamer(sink, { silenceMs: 800, editThrottleMs: 0, ...clock })
     s.push('\x1b[31mred\x1b[0m text')
     await clock.advance(100)
-    const sends = sink.events.filter(e => e.type === 'sendNew')
+    const sends = sink.events.filter((e): e is Extract<FakeEvent, { type: 'sendNew' }> => e.type === 'sendNew')
     assert.ok(!sends[0].text.includes('\x1b'))
     assert.match(sends[0].text, /red text/)
 })

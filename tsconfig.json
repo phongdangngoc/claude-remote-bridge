@@ -1,0 +1,17 @@
+{
+    "compilerOptions": {
+        "target": "es2020",
+        "module": "nodenext",
+        "moduleResolution": "nodenext",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "outDir": "dist",
+        "rootDir": ".",
+        "declaration": false,
+        "sourceMap": true,
+        "newLine": "lf",
+        "forceConsistentCasingInFileNames": true
+    },
+    "include": ["bridge.ts", "lib/**/*.ts", "test/**/*.ts"]
+}
