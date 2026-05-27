@@ -1,17 +1,22 @@
-import path from 'path'
-import { TelegramClient, isRateLimit, isInvalidToken } from './telegram.mjs'
-import * as tmux from './tmux.mjs'
-import * as fifo from './fifo.mjs'
-import { Streamer } from './streamer.mjs'
-import { detectPrompt } from './parser.mjs'
-import { routeUpdate } from './dispatcher.mjs'
-import { loadConfig, loadState, saveState, getFifoDir } from './config.mjs'
+import { TelegramClient, isRateLimit, isInvalidToken, TelegramError } from './telegram.js'
+import * as tmux from './tmux.js'
+import * as fifo from './fifo.js'
+import { Streamer, Sink } from './streamer.js'
+import { detectPrompt, Option } from './parser.js'
+import { routeUpdate, BridgeState, Ctx } from './dispatcher.js'
+import { loadConfig, loadState, saveState, getFifoDir } from './config.js'
 
-function log(level, actor, msg) {
+type LogLevel = 'info' | 'warn' | 'error'
+
+function log(level: LogLevel, actor: string, msg: string): void {
     process.stderr.write(`[${level}] [${actor}] ${msg}\n`)
 }
 
-export async function runDaemon() {
+function errMsg(e: unknown): string {
+    return e instanceof Error ? e.message : String(e)
+}
+
+export async function runDaemon(): Promise<void> {
     const config = await loadConfig()
     const state = await loadState()
     const tg = new TelegramClient(config.bot_token, {
@@ -24,14 +29,14 @@ export async function runDaemon() {
     try {
         await tg.deleteWebhook()
     } catch (e) {
-        log('warn', 'telegram', `deleteWebhook failed: ${e.message}`)
+        log('warn', 'telegram', `deleteWebhook failed: ${errMsg(e)}`)
         if (isInvalidToken(e)) {
-            log('error', 'telegram', 'Invalid bot token. Run: node bridge.mjs init')
+            log('error', 'telegram', 'Invalid bot token. Run: node dist/bridge.js init')
             process.exit(78)  // EX_CONFIG
         }
     }
 
-    const bridgeState = {
+    const bridgeState: BridgeState = {
         attached: null,
         startedAt: Date.now(),
         lastFifoByteAt: 0,
@@ -40,7 +45,7 @@ export async function runDaemon() {
 
     let lastUpdateId = state.last_update_id ?? 0
 
-    async function attach(sessionName) {
+    async function attach(sessionName: string): Promise<void> {
         if (bridgeState.attached) {
             await detach()
         }
@@ -50,16 +55,15 @@ export async function runDaemon() {
         const stream = fifo.openReadStream(fifoPath)
         await tmux.pipePaneStart(sessionName, `cat > ${JSON.stringify(fifoPath)}`)
 
-        const sink = {
-            sendNew: async (text) => {
+        const sink: Sink = {
+            sendNew: async (text: string) => {
                 const msg = await tg.sendMessage(config.chat_id, text)
                 return msg.message_id
             },
-            edit: async (id, text) => {
+            edit: async (id: number, text: string) => {
                 await tg.editMessageText(config.chat_id, id, text)
             },
-            onSilence: async (_buf) => {
-                // Capture pane, detect prompt
+            onSilence: async (_buf: string) => {
                 try {
                     const captured = await tmux.capturePane(sessionName, { lines: config.snapshot_lines })
                     const prompt = detectPrompt(captured)
@@ -67,13 +71,15 @@ export async function runDaemon() {
                         await sendApproveButtons(prompt.options)
                     } else if (prompt.type === 'menu') {
                         await sendMenuButtons(prompt.options)
-                        bridgeState.attached.menuCursor = prompt.options.findIndex(o => o.selected)
+                        if (bridgeState.attached) {
+                            bridgeState.attached.menuCursor = prompt.options.findIndex(o => o.selected)
+                        }
                     }
                 } catch (e) {
-                    log('warn', 'parser', `silence handler failed: ${e.message}`)
+                    log('warn', 'parser', `silence handler failed: ${errMsg(e)}`)
                 }
             },
-            onError: (e) => {
+            onError: (e: Error) => {
                 bridgeState.errorsLastHour++
                 log('warn', 'streamer', e.message)
             },
@@ -85,11 +91,11 @@ export async function runDaemon() {
             maxMessageChars: config.max_message_chars,
         })
 
-        stream.on('data', (chunk) => {
+        stream.on('data', (chunk: string | Buffer) => {
             bridgeState.lastFifoByteAt = Date.now()
             streamer.push(chunk)
         })
-        stream.on('error', (e) => log('warn', 'fifo', e.message))
+        stream.on('error', (e: Error) => log('warn', 'fifo', e.message))
         stream.on('end', () => log('info', 'fifo', `EOF on ${fifoPath}`))
 
         bridgeState.attached = { session: sessionName, fifoPath, stream, streamer, menuCursor: 0 }
@@ -98,7 +104,7 @@ export async function runDaemon() {
         log('info', 'attach', `attached to ${sessionName}`)
     }
 
-    async function detach() {
+    async function detach(): Promise<void> {
         if (!bridgeState.attached) return
         const { session, fifoPath, stream, streamer } = bridgeState.attached
         streamer.abort()
@@ -111,7 +117,7 @@ export async function runDaemon() {
         log('info', 'detach', `detached from ${session}`)
     }
 
-    async function sendApproveButtons(options) {
+    async function sendApproveButtons(options: Option[]): Promise<void> {
         const inline = options.map(o => ({
             text: o.label.length > 25 ? o.label.slice(0, 22) + '…' : o.label,
             callback_data: `approve:${o.index}`,
@@ -121,12 +127,11 @@ export async function runDaemon() {
         })
     }
 
-    async function sendMenuButtons(options) {
+    async function sendMenuButtons(options: Option[]): Promise<void> {
         const buttons = options.slice(0, 8).map((o, i) => ({
             text: `${i + 1}. ${o.label.length > 20 ? o.label.slice(0, 17) + '…' : o.label}`,
             callback_data: `menu:${i}`,
         }))
-        // Split into rows of 2
         const rows = []
         for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2))
         await tg.sendMessage(config.chat_id, '👇 Choose an option:', {
@@ -134,9 +139,9 @@ export async function runDaemon() {
         })
     }
 
-    async function sendStatus() { /* delegated to dispatcher cmdStatus */ }
+    async function sendStatus(): Promise<void> { /* delegated to dispatcher cmdStatus */ }
 
-    const ctx = {
+    const ctx: Ctx = {
         state: bridgeState,
         config,
         tg,
@@ -153,7 +158,7 @@ export async function runDaemon() {
                 await attach(state.attached_session)
                 await tg.sendMessage(config.chat_id, `🔄 Bridge restarted — reattached to \`${state.attached_session}\``)
             } catch (e) {
-                log('warn', 'reattach', e.message)
+                log('warn', 'reattach', errMsg(e))
                 state.attached_session = null
                 await saveState({ ...state, attached_session: null })
             }
@@ -168,7 +173,7 @@ export async function runDaemon() {
 
     // Signal handlers
     let shuttingDown = false
-    const shutdown = async (signal) => {
+    const shutdown = async (signal: string): Promise<void> => {
         if (shuttingDown) return
         shuttingDown = true
         log('info', 'daemon', `received ${signal}, shutting down`)
@@ -176,9 +181,9 @@ export async function runDaemon() {
         await saveState({ ...state, last_update_id: lastUpdateId, outbound_message_id: null })
         process.exit(0)
     }
-    process.on('SIGTERM', () => shutdown('SIGTERM'))
-    process.on('SIGINT',  () => shutdown('SIGINT'))
-    process.on('uncaughtException', async (e) => {
+    process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+    process.on('SIGINT',  () => { void shutdown('SIGINT') })
+    process.on('uncaughtException', async (e: Error) => {
         log('error', 'daemon', `uncaughtException: ${e.stack || e.message}`)
         await saveState({ ...state, last_update_id: lastUpdateId, outbound_message_id: null }).catch(() => {})
         process.exit(1)
@@ -196,7 +201,7 @@ export async function runDaemon() {
                 try {
                     await routeUpdate(update, ctx)
                 } catch (e) {
-                    log('error', 'dispatch', `update ${update.update_id}: ${e.message}`)
+                    log('error', 'dispatch', `update ${update.update_id}: ${errMsg(e)}`)
                 }
             }
             if (updates.length > 0) {
@@ -208,12 +213,12 @@ export async function runDaemon() {
                 process.exit(78)
             }
             if (isRateLimit(e)) {
-                const wait = (e.parameters?.retry_after ?? 5) * 1000
+                const wait = ((e as TelegramError).parameters?.retry_after ?? 5) * 1000
                 log('warn', 'telegram', `rate limited, sleeping ${wait}ms`)
                 await new Promise(r => setTimeout(r, wait))
                 continue
             }
-            log('warn', 'telegram', `poll error: ${e.message}; backoff ${backoff}ms`)
+            log('warn', 'telegram', `poll error: ${errMsg(e)}; backoff ${backoff}ms`)
             await new Promise(r => setTimeout(r, backoff))
             backoff = Math.min(backoff * 2, 60000)
         }

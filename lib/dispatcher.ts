@@ -1,51 +1,71 @@
-import * as tmux from './tmux.mjs'
+import * as tmux from './tmux.js'
+import type { Streamer } from './streamer.js'
+import type { Config } from './config.js'
+import type { TelegramClient, TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from './telegram.js'
+import type { ReadStream } from 'fs'
 
-/**
- * Dispatcher routes Telegram updates → bridge actions.
- *
- * Context interface (`ctx`):
- *   state: { attached, ... } shared bridge state
- *   config: loaded config
- *   tg: TelegramClient
- *   chatId: target chat id
- *   attach(name): Promise<void>
- *   detach(): Promise<void>
- *   sendStatus(): Promise<void>
- */
+export interface AttachedSession {
+    session: string
+    fifoPath: string
+    stream: ReadStream
+    streamer: Streamer
+    menuCursor: number
+}
 
-export async function routeUpdate(update, ctx) {
+export interface BridgeState {
+    attached: AttachedSession | null
+    startedAt: number
+    lastFifoByteAt: number
+    errorsLastHour: number
+}
+
+export interface Ctx {
+    state: BridgeState
+    config: Config
+    tg: TelegramClient
+    chatId: number | string
+    attach(name: string): Promise<void>
+    detach(): Promise<void>
+    sendStatus(): Promise<void>
+}
+
+export async function routeUpdate(update: TelegramUpdate, ctx: Ctx): Promise<void> {
     if (update.message) {
-        return routeMessage(update.message, ctx)
+        await routeMessage(update.message, ctx)
+        return
     }
     if (update.callback_query) {
-        return routeCallback(update.callback_query, ctx)
+        await routeCallback(update.callback_query, ctx)
     }
 }
 
-function isAllowed(fromId, ctx) {
+function isAllowed(fromId: number, ctx: Ctx): boolean {
     return ctx.config.allowed_chat_ids.map(Number).includes(Number(fromId))
 }
 
 // If config.thread_id is set, only accept updates from that forum topic.
 // Telegram sets message_thread_id on messages inside a forum topic, and
 // callback_query.message inherits it. Missing → top-level (General) chat.
-function isCorrectThread(msgOrCb, ctx) {
+function isCorrectThread(msgOrCb: TelegramMessage | TelegramCallbackQuery, ctx: Ctx): boolean {
     const configured = ctx.config.thread_id ? Number(ctx.config.thread_id) : null
     if (configured === null) return true
-    const incoming = msgOrCb.message_thread_id ?? msgOrCb.message?.message_thread_id ?? null
-    return Number(incoming) === configured
+    const incoming = (msgOrCb as TelegramMessage).message_thread_id
+        ?? (msgOrCb as TelegramCallbackQuery).message?.message_thread_id
+        ?? null
+    return incoming !== null && Number(incoming) === configured
 }
 
-async function routeMessage(msg, ctx) {
+async function routeMessage(msg: TelegramMessage, ctx: Ctx): Promise<void> {
+    if (!msg.from) return
     if (!isAllowed(msg.from.id, ctx)) return
     if (!isCorrectThread(msg, ctx)) return
     const text = (msg.text ?? '').trim()
     if (!text) return
 
     if (text.startsWith('/')) {
-        return runCommand(text, ctx)
+        await runCommand(text, ctx)
+        return
     }
-    // Plain text → send to attached session
     if (!ctx.state.attached) {
         await ctx.tg.sendMessage(ctx.chatId, '⚠️ Not attached. Use `/list` then `/attach <name>`.')
         return
@@ -54,21 +74,22 @@ async function routeMessage(msg, ctx) {
         await tmux.sendKeys(ctx.state.attached.session, text, { literal: true })
         await tmux.sendEnter(ctx.state.attached.session)
     } catch (e) {
-        await ctx.tg.sendMessage(ctx.chatId, `❌ send-keys failed: ${e.message}`)
+        await ctx.tg.sendMessage(ctx.chatId, `❌ send-keys failed: ${(e as Error).message}`)
     }
 }
 
-async function routeCallback(cb, ctx) {
+async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void> {
     if (!isAllowed(cb.from.id, ctx)) {
-        return ctx.tg.answerCallbackQuery(cb.id, 'Not authorized')
+        await ctx.tg.answerCallbackQuery(cb.id, 'Not authorized')
+        return
     }
     if (!isCorrectThread(cb, ctx)) {
-        return ctx.tg.answerCallbackQuery(cb.id, 'Wrong thread')
+        await ctx.tg.answerCallbackQuery(cb.id, 'Wrong thread')
+        return
     }
-    const data = cb.data || ''
+    const data = cb.data ?? ''
     // data formats:
     //   approve:1  → send "1" + Enter
-    //   approve:2  → send "2" + Enter
     //   approve:no → send Escape
     //   menu:N     → send Down*N + Enter (N is target index from top, 0-based)
     //   key:Enter|Escape|Up|Down → send special key
@@ -76,6 +97,10 @@ async function routeCallback(cb, ctx) {
     try {
         if (data.startsWith('approve:')) {
             const action = data.slice(8)
+            if (!ctx.state.attached) {
+                await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
+                return
+            }
             if (action === 'no') {
                 await tmux.sendSpecialKey(ctx.state.attached.session, 'Escape')
             } else {
@@ -84,8 +109,12 @@ async function routeCallback(cb, ctx) {
             }
             await ctx.tg.answerCallbackQuery(cb.id, `Sent: ${action}`)
         } else if (data.startsWith('menu:')) {
+            if (!ctx.state.attached) {
+                await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
+                return
+            }
             const target = Number(data.slice(5))
-            const current = ctx.state.attached?.menuCursor ?? 0
+            const current = ctx.state.attached.menuCursor ?? 0
             const delta = target - current
             const key = delta >= 0 ? 'Down' : 'Up'
             for (let i = 0; i < Math.abs(delta); i++) {
@@ -94,6 +123,10 @@ async function routeCallback(cb, ctx) {
             await tmux.sendEnter(ctx.state.attached.session)
             await ctx.tg.answerCallbackQuery(cb.id, `Selected option ${target + 1}`)
         } else if (data.startsWith('key:')) {
+            if (!ctx.state.attached) {
+                await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
+                return
+            }
             const key = data.slice(4)
             await tmux.sendSpecialKey(ctx.state.attached.session, key)
             await ctx.tg.answerCallbackQuery(cb.id, `Pressed ${key}`)
@@ -106,11 +139,11 @@ async function routeCallback(cb, ctx) {
             await ctx.tg.answerCallbackQuery(cb.id, 'Unknown action')
         }
     } catch (e) {
-        await ctx.tg.answerCallbackQuery(cb.id, `Error: ${e.message}`.slice(0, 200))
+        await ctx.tg.answerCallbackQuery(cb.id, `Error: ${(e as Error).message}`.slice(0, 200))
     }
 }
 
-async function runCommand(text, ctx) {
+async function runCommand(text: string, ctx: Ctx): Promise<void> {
     const [cmd, ...args] = text.split(/\s+/)
     switch (cmd) {
         case '/help':    return cmdHelp(ctx)
@@ -122,11 +155,11 @@ async function runCommand(text, ctx) {
         case '/kill':    return cmdKill(args[0], ctx)
         case '/raw':     return cmdRaw(args.join(' '), ctx)
         default:
-            return ctx.tg.sendMessage(ctx.chatId, `Unknown command: \`${cmd}\`. Try /help.`)
+            await ctx.tg.sendMessage(ctx.chatId, `Unknown command: \`${cmd}\`. Try /help.`)
     }
 }
 
-async function cmdHelp(ctx) {
+async function cmdHelp(ctx: Ctx): Promise<void> {
     const lines = [
         '*claude-remote-bridge*',
         '`/list`               — list tmux sessions',
@@ -144,10 +177,11 @@ async function cmdHelp(ctx) {
     await ctx.tg.sendMessage(ctx.chatId, lines.join('\n'))
 }
 
-async function cmdList(ctx) {
+async function cmdList(ctx: Ctx): Promise<void> {
     const sessions = await tmux.listSessions()
     if (sessions.length === 0) {
-        return ctx.tg.sendMessage(ctx.chatId, '_No tmux sessions running._\nStart one with `tmux new -d -s <name> "claude"`')
+        await ctx.tg.sendMessage(ctx.chatId, '_No tmux sessions running._\nStart one with `tmux new -d -s <name> "claude"`')
+        return
     }
     const lines = sessions.map(s => {
         const marker = ctx.state.attached?.session === s.name ? '📡 ' : '   '
@@ -157,31 +191,33 @@ async function cmdList(ctx) {
     await ctx.tg.sendMessage(ctx.chatId, lines.join('\n'))
 }
 
-async function cmdAttach(name, ctx) {
-    if (!name) return ctx.tg.sendMessage(ctx.chatId, 'Usage: `/attach <session-name>`')
+async function cmdAttach(name: string | undefined, ctx: Ctx): Promise<void> {
+    if (!name) { await ctx.tg.sendMessage(ctx.chatId, 'Usage: `/attach <session-name>`'); return }
     if (!(await tmux.hasSession(name))) {
         const sessions = await tmux.listSessions()
         const list = sessions.map(s => `\`${s.name}\``).join(', ') || '(none)'
-        return ctx.tg.sendMessage(ctx.chatId, `Session \`${name}\` not found.\nAvailable: ${list}`)
+        await ctx.tg.sendMessage(ctx.chatId, `Session \`${name}\` not found.\nAvailable: ${list}`)
+        return
     }
     try {
         await ctx.attach(name)
         await ctx.tg.sendMessage(ctx.chatId, `📡 Attached to \`${name}\`. Send messages to chat with Claude.`)
     } catch (e) {
-        await ctx.tg.sendMessage(ctx.chatId, `❌ Attach failed: ${e.message}`)
+        await ctx.tg.sendMessage(ctx.chatId, `❌ Attach failed: ${(e as Error).message}`)
     }
 }
 
-async function cmdDetach(ctx) {
+async function cmdDetach(ctx: Ctx): Promise<void> {
     if (!ctx.state.attached) {
-        return ctx.tg.sendMessage(ctx.chatId, '_Not attached._')
+        await ctx.tg.sendMessage(ctx.chatId, '_Not attached._')
+        return
     }
     const name = ctx.state.attached.session
     await ctx.detach()
     await ctx.tg.sendMessage(ctx.chatId, `🔌 Detached from \`${name}\`. Session still running.`)
 }
 
-async function cmdStatus(ctx) {
+async function cmdStatus(ctx: Ctx): Promise<void> {
     const uptime = Math.floor((Date.now() - ctx.state.startedAt) / 1000)
     const lines = [
         `*Bridge status*`,
@@ -193,24 +229,26 @@ async function cmdStatus(ctx) {
     await ctx.tg.sendMessage(ctx.chatId, lines.join('\n'))
 }
 
-async function cmdNew(name, ctx) {
-    if (!name) return ctx.tg.sendMessage(ctx.chatId, 'Usage: `/new <session-name>`')
+async function cmdNew(name: string | undefined, ctx: Ctx): Promise<void> {
+    if (!name) { await ctx.tg.sendMessage(ctx.chatId, 'Usage: `/new <session-name>`'); return }
     if (await tmux.hasSession(name)) {
-        return ctx.tg.sendMessage(ctx.chatId, `Session \`${name}\` already exists. Use /attach.`)
+        await ctx.tg.sendMessage(ctx.chatId, `Session \`${name}\` already exists. Use /attach.`)
+        return
     }
     try {
         await tmux.newSession(name)
         await ctx.tg.sendMessage(ctx.chatId, `🆕 Created \`${name}\`. Attaching...`)
         await ctx.attach(name)
     } catch (e) {
-        await ctx.tg.sendMessage(ctx.chatId, `❌ Create failed: ${e.message}`)
+        await ctx.tg.sendMessage(ctx.chatId, `❌ Create failed: ${(e as Error).message}`)
     }
 }
 
-async function cmdKill(name, ctx) {
-    if (!name) return ctx.tg.sendMessage(ctx.chatId, 'Usage: `/kill <session-name>`')
+async function cmdKill(name: string | undefined, ctx: Ctx): Promise<void> {
+    if (!name) { await ctx.tg.sendMessage(ctx.chatId, 'Usage: `/kill <session-name>`'); return }
     if (!(await tmux.hasSession(name))) {
-        return ctx.tg.sendMessage(ctx.chatId, `Session \`${name}\` does not exist.`)
+        await ctx.tg.sendMessage(ctx.chatId, `Session \`${name}\` does not exist.`)
+        return
     }
     await ctx.tg.sendMessage(ctx.chatId, `⚠️ Kill \`${name}\`?`, {
         reply_markup: {
@@ -222,11 +260,12 @@ async function cmdKill(name, ctx) {
     })
 }
 
-async function cmdRaw(text, ctx) {
+async function cmdRaw(text: string, ctx: Ctx): Promise<void> {
     if (!ctx.state.attached) {
-        return ctx.tg.sendMessage(ctx.chatId, '_Not attached._')
+        await ctx.tg.sendMessage(ctx.chatId, '_Not attached._')
+        return
     }
-    if (!text) return ctx.tg.sendMessage(ctx.chatId, 'Usage: `/raw <text>` (sends without Enter)')
+    if (!text) { await ctx.tg.sendMessage(ctx.chatId, 'Usage: `/raw <text>` (sends without Enter)'); return }
     await tmux.sendKeys(ctx.state.attached.session, text, { literal: true })
     await ctx.tg.sendMessage(ctx.chatId, `Sent (no Enter): \`${text.slice(0, 100)}\``)
 }

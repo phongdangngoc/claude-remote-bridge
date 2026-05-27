@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BRIDGE="${REPO_DIR}/bridge.mjs"
+BRIDGE="${REPO_DIR}/dist/bridge.js"
 NODE_PATH="$(command -v node)"
 
 if [[ -z "${NODE_PATH}" ]]; then
@@ -14,7 +14,8 @@ NODE_VERSION="$(node --version)"
 echo "Using node: ${NODE_PATH} (${NODE_VERSION})"
 
 if [[ ! -f "${BRIDGE}" ]]; then
-    echo "bridge.mjs not found at ${BRIDGE}"
+    echo "Build output missing at ${BRIDGE}."
+    echo "Run: npm install && npm run build"
     exit 1
 fi
 
