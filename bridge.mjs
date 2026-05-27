@@ -46,6 +46,7 @@ async function cmdInit() {
     const bot_token = imported?.bot_token ?? (await ask('Bot token: ')).trim()
     const chat_id   = imported?.chat_id   ?? (await ask('Chat ID: ')).trim()
     const allowRaw  = (await ask(`Allowed user IDs (comma-separated, leave blank = [${chat_id}]): `)).trim()
+    const threadRaw = (await ask('Forum topic / thread ID (leave blank for none): ')).trim()
     rl.close()
 
     if (!bot_token || !chat_id) fail('bot_token and chat_id required')
@@ -55,6 +56,7 @@ async function cmdInit() {
         : [Number(chat_id)]
 
     const cfg = { bot_token, chat_id, allowed_chat_ids, ...DEFAULTS }
+    if (threadRaw) cfg.thread_id = Number(threadRaw)
     await saveConfig(cfg)
     info(`Saved → ${getConfigPath()}`)
     info('Verifying token...')

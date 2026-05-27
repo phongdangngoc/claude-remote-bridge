@@ -75,6 +75,30 @@ From your phone, message the bot:
 
 When attached, plain text messages → `send-keys` to Claude. Inline buttons appear when an approve dialog or menu is detected.
 
+### Forum topics / threads
+
+The bridge supports Telegram **forum topics** (also called threads). Useful when you want to keep Claude conversations inside a single dedicated topic of a group chat instead of in DMs.
+
+To enable, set `thread_id` in `~/.config/claude-bridge/config.json`:
+
+```json
+{
+  "bot_token": "…",
+  "chat_id": -1001234567890,
+  "thread_id": 42,
+  "allowed_chat_ids": [123456789]
+}
+```
+
+`bridge.mjs init` will prompt you for the thread ID at setup time; leave it blank to operate against the main chat as before.
+
+Behaviour when `thread_id` is set:
+
+- All bot output is posted into that topic (`message_thread_id` is attached to every `sendMessage`).
+- Inbound messages and button taps from other topics are silently ignored, so noise in other threads doesn't trigger commands.
+
+To find a topic's ID, open the topic in the Telegram web client — the URL contains `/{thread_id}`. Or forward a message from the topic to [@RawDataBot](https://t.me/RawDataBot) and look for `message_thread_id`.
+
 ## Architecture
 
 ```
