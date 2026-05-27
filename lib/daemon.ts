@@ -72,7 +72,8 @@ export async function runDaemon(): Promise<void> {
                     } else if (prompt.type === 'menu') {
                         await sendMenuButtons(prompt.options)
                         if (bridgeState.attached) {
-                            bridgeState.attached.menuCursor = prompt.options.findIndex(o => o.selected)
+                            const idx = prompt.options.findIndex(o => o.selected)
+                            bridgeState.attached.menuCursor = idx < 0 ? 0 : idx
                         }
                     }
                 } catch (e) {
