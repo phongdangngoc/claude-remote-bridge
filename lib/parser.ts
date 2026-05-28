@@ -46,6 +46,34 @@ function extractNumberedOptions(text: string): Option[] {
 
 function extractMenuOptions(text: string): Option[] {
     const lines = text.split('\n')
+
+    // Strategy 1 — numbered Claude Code menu:
+    //   ❯ 1. Ngựa
+    //        description (indented continuation, ignored)
+    //     2. Hươu cao cổ
+    //     ...
+    //     N. Last option
+    // Find consecutive 1..N at the END of the snapshot (so passing references
+    // like "step 1." earlier in the response don't get mistaken for the menu).
+    const numberedRe = /^(\s*[❯►>]?\s*)(\d+)\.\s+(\S.*?)\s*$/
+    const hits: Array<{ label: string; num: number; selected: boolean }> = []
+    for (const line of lines) {
+        const m = numberedRe.exec(line)
+        if (m) hits.push({ label: m[3], num: Number(m[2]), selected: CURSOR_RE.test(m[1]) })
+    }
+    if (hits.length >= 2) {
+        const tail = [hits[hits.length - 1]]
+        for (let i = hits.length - 2; i >= 0; i--) {
+            if (hits[i].num === tail[0].num - 1) tail.unshift(hits[i])
+            else break
+        }
+        if (tail.length >= 2 && tail[0].num === 1) {
+            return tail.map((h, i) => ({ index: i, label: h.label, selected: h.selected }))
+        }
+    }
+
+    // Strategy 2 — legacy indented block menu (non-numbered, walks the indented
+    // block surrounding a cursor line).
     const cursorIdx = lines.findIndex(l => CURSOR_RE.test(l))
     if (cursorIdx < 0) return []
     let start = cursorIdx, end = cursorIdx
@@ -59,7 +87,7 @@ function extractMenuOptions(text: string): Option[] {
 }
 
 export function detectPrompt(plainText: string): PromptResult {
-    const last20 = lastN(plainText, 20)
+    const last20 = lastN(plainText, 40)
     const hasCursor = CURSOR_RE.test(last20)
 
     if (!hasCursor) return { type: 'free' }
