@@ -120,6 +120,7 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 await tmux.sendKeys(ctx.state.attached.session, action, { literal: true })
                 await tmux.sendEnter(ctx.state.attached.session)
             }
+            ctx.state.attached.snapshotMessageId = null
             await ctx.tg.answerCallbackQuery(cb.id, `Sent: ${action}`)
             const opts = ctx.state.attached.lastPromptOptions
             const picked = action === 'no'
@@ -144,6 +145,7 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 await tmux.sendSpecialKey(ctx.state.attached.session, key)
             }
             await tmux.sendEnter(ctx.state.attached.session)
+            ctx.state.attached.snapshotMessageId = null
             await ctx.tg.answerCallbackQuery(cb.id, `Selected option ${target + 1}`)
             const opts = ctx.state.attached.lastPromptOptions
             const picked = opts?.[target] ?? null
@@ -165,6 +167,7 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
             }
             const key = data.slice(4)
             await tmux.sendSpecialKey(ctx.state.attached.session, key)
+            ctx.state.attached.snapshotMessageId = null
             await ctx.tg.answerCallbackQuery(cb.id, `Pressed ${key}`)
         } else if (data.startsWith('confirm:kill:')) {
             const name = data.slice(13)

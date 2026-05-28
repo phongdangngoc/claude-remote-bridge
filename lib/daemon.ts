@@ -4,7 +4,7 @@ import { TelegramClient, isRateLimit, isInvalidToken, TelegramError } from './te
 import * as tmux from './tmux.js'
 import * as fifo from './fifo.js'
 import { Streamer, Sink } from './streamer.js'
-import { detectPrompt, Option } from './parser.js'
+import { detectPrompt, Option, PromptResult } from './parser.js'
 import { routeUpdate, BridgeState, Ctx } from './dispatcher.js'
 import { loadConfig, loadState, saveState, getFifoDir } from './config.js'
 import { errMsg } from './errors.js'
@@ -23,6 +23,109 @@ function gitBranch(cwd: string): Promise<string> {
         child.on('error', reject)
         child.on('close', (code) => code === 0 ? resolve(out.trim()) : reject(new Error(`git exit ${code}`)))
     })
+}
+
+// Trim a tmux pane capture down to the latest user turn: drop the host /
+// status footer and everything above the most recent `❯ <user message>`
+// line. The result is approximately "what's new since the user's last
+// message" — the question they asked plus Claude's reply, minus prior
+// history and the bottom status bar.
+//
+// Fails-soft: if neither marker is found, the original text is returned so
+// the snapshot still goes through (some pane states won't match the
+// heuristics — better a noisy frame than a blank one).
+export function trimToLatestTurn(text: string): string {
+    const lines = text.split('\n')
+
+    // Find the status footer. Claude Code prints a host line containing
+    // `Session: <uuid>` plus 3-4 stats lines; it may be preceded by a
+    // separator (─/━/═) and blank lines that should also be dropped.
+    let footerStart = lines.length
+    for (let i = 0; i < lines.length; i++) {
+        if (/Session:\s+[0-9a-f-]{8,}/i.test(lines[i])) {
+            footerStart = i
+            while (footerStart > 0 && (/^[\s─━═]+$/.test(lines[footerStart - 1]) || lines[footerStart - 1].trim() === '')) {
+                footerStart--
+            }
+            break
+        }
+    }
+
+    // Walk backwards from the footer for the last user-input cursor line.
+    // Numbered menu rows (`❯ 1. ...`) are cursor lines too, so exclude them.
+    let userLineIdx = -1
+    for (let i = footerStart - 1; i >= 0; i--) {
+        if (/^\s*[❯►>]\s+\S/.test(lines[i]) && !/^\s*[❯►>]\s+\d+\.\s/.test(lines[i])) {
+            userLineIdx = i
+            break
+        }
+    }
+
+    const sliced = userLineIdx >= 0
+        ? lines.slice(userLineIdx, footerStart)
+        : lines.slice(0, footerStart)
+
+    // Trim trailing input-prompt artifacts: the empty `❯` cursor line, the
+    // separator rules that bracket it, and any blank padding. Without this
+    // every snapshot ends with an empty cursor + ─── that isn't part of the
+    // response. Menu states still match (the menu's "Enter to select…"
+    // footer isn't an empty cursor) so they're preserved.
+    let endIdx = sliced.length
+    while (endIdx > 0) {
+        const last = sliced[endIdx - 1]
+        if (/^\s*[❯►>][\s▌█▏]*$/.test(last) || /^[\s─━═]+$/.test(last) || last.trim() === '') {
+            endIdx--
+        } else {
+            break
+        }
+    }
+    return sliced.slice(0, endIdx).join('\n')
+}
+
+// Did the pane reach an input boundary? "Settled" means Claude has yielded
+// control back to the user — either by finishing a response (idle prompt)
+// or by surfacing an approve/menu prompt. The empty `❯` cursor at the
+// bottom alone isn't enough: it's present even before Claude has begun to
+// respond, so we also require the absence of an active spinner status AND
+// the presence of a Claude-emitted content indicator (response bullet or
+// tool-call glyph) between the user's last input line and the footer.
+function paneIsSettled(captured: string, prompt: PromptResult): boolean {
+    if (prompt.type === 'approve' || prompt.type === 'menu') return true
+
+    // Active gerund status ("Cooking for 3s", "Thinking for 5s", …) and the
+    // animated braille spinner both signal Claude is still generating.
+    if (/\b\w+ing\s+for\s+\d+\s*s\b/i.test(captured)) return false
+    if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠟⠷⠿]/.test(captured)) return false
+
+    const lines = captured.split('\n')
+    let searchEnd = lines.length
+    for (let i = 0; i < lines.length; i++) {
+        if (/Session:\s+[0-9a-f-]{8,}/i.test(lines[i])) { searchEnd = i; break }
+    }
+
+    // Require that Claude has actually produced content after the user's
+    // last input. The response bullet `●` covers normal answers; `⏺` and
+    // `⎿` cover tool invocations and their output continuations.
+    let userLineIdx = -1
+    for (let i = searchEnd - 1; i >= 0; i--) {
+        if (/^\s*[❯►>]\s+\S/.test(lines[i]) && !/^\s*[❯►>]\s+\d+\.\s/.test(lines[i])) {
+            userLineIdx = i
+            break
+        }
+    }
+    if (userLineIdx >= 0) {
+        let hasResponse = false
+        for (let i = userLineIdx + 1; i < searchEnd; i++) {
+            if (/^\s*[●⏺⎿]/.test(lines[i])) { hasResponse = true; break }
+        }
+        if (!hasResponse) return false
+    }
+
+    // Empty input cursor sitting just above the status footer = idle.
+    for (let i = Math.max(0, searchEnd - 5); i < searchEnd; i++) {
+        if (/^\s*[❯►>][\s▌█▏]*$/.test(lines[i])) return true
+    }
+    return false
 }
 
 // Build the per-message header. Fails-soft: any missing piece is dropped.
@@ -85,12 +188,11 @@ export async function runDaemon(): Promise<void> {
         }
 
         // Snapshot-on-settle: raw FIFO bytes are only an activity signal.
-        // Once the pane has been quiet for `silence_ms`, we send the visible
-        // pane content (via tmux capture-pane) as a clean snapshot — this
-        // sidesteps the redraw spam from TUIs like Claude Code that animate
-        // a spinner/status line and never go truly idle byte-wise.
-        let lastSentBody: string | null = null
-        let lastEditAt = 0
+        // Once the pane has been quiet for `silence_ms` AND we can tell
+        // Claude is back at an input boundary (idle prompt or approve/menu
+        // prompt visible), we send one snapshot as a fresh Telegram message.
+        // No edits — each turn produces exactly one persistent message in
+        // chat history, so scrolling back gives a clean transcript.
         let lastPromptKey: string | null = null
         const getSnapId = (): number | null => bridgeState.attached?.snapshotMessageId ?? null
         const setSnapId = (id: number | null): void => {
@@ -105,39 +207,32 @@ export async function runDaemon(): Promise<void> {
                 log('warn', 'snapshot', `capturePane failed: ${errMsg(e)}`)
                 return
             }
-            const cleaned = captured.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '')
-            if (cleaned && (cleaned !== lastSentBody || getSnapId() == null)) {
+            const trimmedTurn = trimToLatestTurn(captured)
+            const cleaned = trimmedTurn.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '')
+            const prompt = detectPrompt(cleaned)
+
+            // Only send once Claude has reached an input boundary. Mid-thought
+            // pauses (Claude waiting on its own API call) shouldn't produce
+            // intermediate snapshots — wait for the real settle.
+            const settled = paneIsSettled(captured, prompt)
+            if (settled && cleaned && getSnapId() == null) {
                 let header = ''
                 try { header = await buildHeader(sessionName, cachedCwd) } catch {}
                 const max = config.max_message_chars
                 const trimmed = cleaned.length > max ? '[…truncated…]\n' + cleaned.slice(-max) : cleaned
                 const fenced = '```\n' + trimmed.replace(/```/g, '``​`') + '\n```'
                 const body = header ? `${header}\n${fenced}` : fenced
-                const now = Date.now()
                 try {
-                    if (getSnapId() == null) {
-                        const msg = await tg.sendMessage(config.chat_id, body)
-                        setSnapId(msg.message_id)
-                        lastEditAt = now
-                        lastSentBody = cleaned
-                        // Buttons (if any) belong to the previous turn — let
-                        // detectPrompt re-emit them under the new message.
-                        lastPromptKey = null
-                        log('info', 'snapshot', `sendNew msgId=${msg.message_id} bodyLen=${body.length}`)
-                    } else if (now - lastEditAt >= config.edit_throttle_ms) {
-                        await tg.editMessageText(config.chat_id, getSnapId()!, body)
-                        lastEditAt = now
-                        lastSentBody = cleaned
-                    }
+                    const msg = await tg.sendMessage(config.chat_id, body)
+                    setSnapId(msg.message_id)
+                    // Buttons (if any) belong to a fresh message — let
+                    // detectPrompt re-emit them under it.
+                    lastPromptKey = null
+                    log('info', 'snapshot', `sendNew msgId=${msg.message_id} bodyLen=${body.length}`)
                 } catch (e) {
-                    const err = e as Error & { code?: number }
-                    log('warn', 'telegram', errMsg(err))
-                    if (err.code === 400 && /not found|can't be edited|message_id_invalid/i.test(err.message)) {
-                        setSnapId(null)
-                    }
+                    log('warn', 'telegram', errMsg(e))
                 }
             }
-            const prompt = detectPrompt(cleaned)
             if (prompt.type === 'approve') {
                 const key = 'a|' + prompt.options.map(o => `${o.index}:${o.label}`).join('|')
                 if (key !== lastPromptKey) {
