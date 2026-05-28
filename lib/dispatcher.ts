@@ -11,6 +11,10 @@ export interface AttachedSession {
     stream: ReadStream
     streamer: Streamer
     menuCursor: number
+    // Null = the next snapshot should start a fresh Telegram message instead
+    // of editing the previous one. Set after each user input so each Q&A is
+    // its own pinned-at-bottom message thread.
+    snapshotMessageId: number | null
 }
 
 export interface BridgeState {
@@ -74,6 +78,9 @@ async function routeMessage(msg: TelegramMessage, ctx: Ctx): Promise<void> {
     try {
         await tmux.sendKeys(ctx.state.attached.session, text, { literal: true })
         await tmux.sendEnter(ctx.state.attached.session)
+        // Start a fresh snapshot message for the response — keeps the latest
+        // turn pinned at the bottom of the chat so the user doesn't scroll up.
+        ctx.state.attached.snapshotMessageId = null
     } catch (e) {
         await ctx.tg.sendMessage(ctx.chatId, `❌ send-keys failed: ${errMsg(e)}`)
     }
@@ -114,7 +121,9 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
                 return
             }
-            const target = Number(data.slice(5))
+            const parts = data.slice(5).split(':')
+            const target = Number(parts[0])
+            const special = parts[1] // 't' = type-something, 'c' = chat-about-this
             const current = ctx.state.attached.menuCursor ?? 0
             const delta = target - current
             const key = delta >= 0 ? 'Down' : 'Up'
@@ -123,6 +132,11 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
             }
             await tmux.sendEnter(ctx.state.attached.session)
             await ctx.tg.answerCallbackQuery(cb.id, `Selected option ${target + 1}`)
+            if (special === 't') {
+                await ctx.tg.sendMessage(ctx.chatId, '📝 Giờ gõ câu trả lời tự do trong chat này, bridge sẽ chuyển vào Claude.')
+            } else if (special === 'c') {
+                await ctx.tg.sendMessage(ctx.chatId, '💬 Đã thoát menu. Cứ chat bình thường — tin nhắn sẽ vào Claude.')
+            }
         } else if (data.startsWith('key:')) {
             if (!ctx.state.attached) {
                 await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')

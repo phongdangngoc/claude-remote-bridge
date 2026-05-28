@@ -84,32 +84,89 @@ export async function runDaemon(): Promise<void> {
             log('warn', 'tmux', `paneCwd failed: ${errMsg(e)}`)
         }
 
-        const sink: Sink = {
-            sendNew: async (text: string) => {
+        // Snapshot-on-settle: raw FIFO bytes are only an activity signal.
+        // Once the pane has been quiet for `silence_ms`, we send the visible
+        // pane content (via tmux capture-pane) as a clean snapshot — this
+        // sidesteps the redraw spam from TUIs like Claude Code that animate
+        // a spinner/status line and never go truly idle byte-wise.
+        let lastSentBody: string | null = null
+        let lastEditAt = 0
+        let lastPromptKey: string | null = null
+        const getSnapId = (): number | null => bridgeState.attached?.snapshotMessageId ?? null
+        const setSnapId = (id: number | null): void => {
+            if (bridgeState.attached) bridgeState.attached.snapshotMessageId = id
+        }
+
+        async function sendSnapshot(): Promise<void> {
+            let captured: string
+            try {
+                captured = await tmux.capturePane(sessionName, { lines: config.snapshot_lines })
+            } catch (e) {
+                log('warn', 'snapshot', `capturePane failed: ${errMsg(e)}`)
+                return
+            }
+            const cleaned = captured.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '')
+            if (cleaned && (cleaned !== lastSentBody || getSnapId() == null)) {
                 let header = ''
                 try { header = await buildHeader(sessionName, cachedCwd) } catch {}
-                const body = header ? `${header}\n${text}` : text
-                const msg = await tg.sendMessage(config.chat_id, body)
-                return msg.message_id
-            },
-            edit: async (id: number, text: string) => {
-                await tg.editMessageText(config.chat_id, id, text)
-            },
-            onSilence: async (_buf: string) => {
+                const max = config.max_message_chars
+                const trimmed = cleaned.length > max ? '[…truncated…]\n' + cleaned.slice(-max) : cleaned
+                const fenced = '```\n' + trimmed.replace(/```/g, '``​`') + '\n```'
+                const body = header ? `${header}\n${fenced}` : fenced
+                const now = Date.now()
                 try {
-                    const captured = await tmux.capturePane(sessionName, { lines: config.snapshot_lines })
-                    const prompt = detectPrompt(captured)
-                    if (prompt.type === 'approve') {
-                        await sendApproveButtons(prompt.options)
-                    } else if (prompt.type === 'menu') {
-                        await sendMenuButtons(prompt.options)
-                        if (bridgeState.attached) {
-                            const idx = prompt.options.findIndex(o => o.selected)
-                            bridgeState.attached.menuCursor = idx < 0 ? 0 : idx
-                        }
+                    if (getSnapId() == null) {
+                        const msg = await tg.sendMessage(config.chat_id, body)
+                        setSnapId(msg.message_id)
+                        lastEditAt = now
+                        lastSentBody = cleaned
+                        // Buttons (if any) belong to the previous turn — let
+                        // detectPrompt re-emit them under the new message.
+                        lastPromptKey = null
+                        log('info', 'snapshot', `sendNew msgId=${msg.message_id} bodyLen=${body.length}`)
+                    } else if (now - lastEditAt >= config.edit_throttle_ms) {
+                        await tg.editMessageText(config.chat_id, getSnapId()!, body)
+                        lastEditAt = now
+                        lastSentBody = cleaned
                     }
                 } catch (e) {
-                    log('warn', 'parser', `silence handler failed: ${errMsg(e)}`)
+                    const err = e as Error & { code?: number }
+                    log('warn', 'telegram', errMsg(err))
+                    if (err.code === 400 && /not found|can't be edited|message_id_invalid/i.test(err.message)) {
+                        setSnapId(null)
+                    }
+                }
+            }
+            const prompt = detectPrompt(cleaned)
+            if (prompt.type === 'approve') {
+                const key = 'a|' + prompt.options.map(o => `${o.index}:${o.label}`).join('|')
+                if (key !== lastPromptKey) {
+                    lastPromptKey = key
+                    await sendApproveButtons(prompt.options)
+                    log('info', 'snapshot', `sent approve buttons (${prompt.options.length})`)
+                }
+            } else if (prompt.type === 'menu') {
+                const key = 'm|' + prompt.options.map(o => `${o.index}:${o.label}:${o.selected ? '*' : ''}`).join('|')
+                if (key !== lastPromptKey) {
+                    lastPromptKey = key
+                    await sendMenuButtons(prompt.options)
+                    log('info', 'snapshot', `sent menu buttons (${prompt.options.length})`)
+                }
+                if (bridgeState.attached) {
+                    const idx = prompt.options.findIndex(o => o.selected)
+                    bridgeState.attached.menuCursor = idx < 0 ? 0 : idx
+                }
+            } else {
+                lastPromptKey = null
+            }
+        }
+
+        const sink: Sink = {
+            sendNew: async () => -1,
+            edit: async () => {},
+            onSilence: async () => {
+                try { await sendSnapshot() } catch (e) {
+                    log('warn', 'snapshot', errMsg(e))
                 }
             },
             onError: (e: Error) => {
@@ -131,7 +188,7 @@ export async function runDaemon(): Promise<void> {
         stream.on('error', (e: Error) => log('warn', 'fifo', e.message))
         stream.on('end', () => log('info', 'fifo', `EOF on ${fifoPath}`))
 
-        bridgeState.attached = { session: sessionName, fifoPath, stream, streamer, menuCursor: 0 }
+        bridgeState.attached = { session: sessionName, fifoPath, stream, streamer, menuCursor: 0, snapshotMessageId: null }
         state.attached_session = sessionName
         await saveState({ ...state, attached_session: sessionName })
         log('info', 'attach', `attached to ${sessionName}`)
@@ -151,23 +208,45 @@ export async function runDaemon(): Promise<void> {
     }
 
     async function sendApproveButtons(options: Option[]): Promise<void> {
-        const inline = options.map(o => ({
-            text: o.label.length > 25 ? o.label.slice(0, 22) + '…' : o.label,
+        const lines = ['👇 *Approve prompt:*', '']
+        options.forEach((o, i) => lines.push(`*${i + 1}.* ${o.label}`))
+        const inline = options.map((o, i) => ({
+            text: String(i + 1),
             callback_data: `approve:${o.index}`,
         }))
-        await tg.sendMessage(config.chat_id, '👇 Approve prompt detected:', {
+        await tg.sendMessage(config.chat_id, lines.join('\n'), {
+            parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: [inline] },
         })
     }
 
     async function sendMenuButtons(options: Option[]): Promise<void> {
-        const buttons = options.slice(0, 8).map((o, i) => ({
-            text: `${i + 1}. ${o.label.length > 20 ? o.label.slice(0, 17) + '…' : o.label}`,
-            callback_data: `menu:${i}`,
-        }))
-        const rows = []
-        for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2))
-        await tg.sendMessage(config.chat_id, '👇 Choose an option:', {
+        // Claude Code "escape hatch" options need different UX: tapping them
+        // doesn't pick a quiz answer, it switches the menu into free-text /
+        // free-chat mode. Rename them so users understand, and tag callback
+        // data so dispatcher can send a follow-up hint after pressing them.
+        const specialize = (label: string): { kind: 't' | 'c' | null; display: string } => {
+            if (/^type something\.?$/i.test(label)) return { kind: 't', display: '📝 Trả lời tự do' }
+            if (/^chat about this$/i.test(label)) return { kind: 'c', display: '💬 Bỏ menu, chat thường' }
+            return { kind: null, display: label }
+        }
+        const limited = options.slice(0, 8)
+        const lines = ['👇 *Choose an option:*', '']
+        limited.forEach((o, i) => {
+            const s = specialize(o.label)
+            lines.push(`*${i + 1}.* ${s.display}`)
+        })
+        const buttons = limited.map((o, i) => {
+            const s = specialize(o.label)
+            return {
+                text: String(i + 1),
+                callback_data: s.kind ? `menu:${i}:${s.kind}` : `menu:${i}`,
+            }
+        })
+        const rows: typeof buttons[] = []
+        for (let i = 0; i < buttons.length; i += 4) rows.push(buttons.slice(i, i + 4))
+        await tg.sendMessage(config.chat_id, lines.join('\n'), {
+            parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: rows },
         })
     }
