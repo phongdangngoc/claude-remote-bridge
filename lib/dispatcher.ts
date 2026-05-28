@@ -4,6 +4,7 @@ import type { Streamer } from './streamer.js'
 import type { Config } from './config.js'
 import type { TelegramClient, TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from './telegram.js'
 import type { ReadStream } from 'fs'
+import type { Option } from './parser.js'
 
 export interface AttachedSession {
     session: string
@@ -11,6 +12,14 @@ export interface AttachedSession {
     stream: ReadStream
     streamer: Streamer
     menuCursor: number
+    // Null = the next snapshot should start a fresh Telegram message instead
+    // of editing the previous one. Set after each user input so each Q&A is
+    // its own pinned-at-bottom message thread.
+    snapshotMessageId: number | null
+    // Options shown in the most recent approve/menu button message, kept so
+    // the callback handler can echo back the chosen option's label.
+    lastPromptOptions: Option[] | null
+    lastPromptType: 'approve' | 'menu' | null
 }
 
 export interface BridgeState {
@@ -74,6 +83,9 @@ async function routeMessage(msg: TelegramMessage, ctx: Ctx): Promise<void> {
     try {
         await tmux.sendKeys(ctx.state.attached.session, text, { literal: true })
         await tmux.sendEnter(ctx.state.attached.session)
+        // Start a fresh snapshot message for the response — keeps the latest
+        // turn pinned at the bottom of the chat so the user doesn't scroll up.
+        ctx.state.attached.snapshotMessageId = null
     } catch (e) {
         await ctx.tg.sendMessage(ctx.chatId, `❌ send-keys failed: ${errMsg(e)}`)
     }
@@ -108,13 +120,24 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 await tmux.sendKeys(ctx.state.attached.session, action, { literal: true })
                 await tmux.sendEnter(ctx.state.attached.session)
             }
+            ctx.state.attached.snapshotMessageId = null
             await ctx.tg.answerCallbackQuery(cb.id, `Sent: ${action}`)
+            const opts = ctx.state.attached.lastPromptOptions
+            const picked = action === 'no'
+                ? null
+                : (opts?.find(o => o.index === Number(action)) ?? null)
+            const label = picked
+                ? `*${picked.index}.* ${picked.label}`
+                : (action === 'no' ? '_no / abort_' : `option ${action}`)
+            await ctx.tg.sendMessage(ctx.chatId, `✅ Đã chọn: ${label}`, { parse_mode: 'Markdown' })
         } else if (data.startsWith('menu:')) {
             if (!ctx.state.attached) {
                 await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
                 return
             }
-            const target = Number(data.slice(5))
+            const parts = data.slice(5).split(':')
+            const target = Number(parts[0])
+            const special = parts[1] // 't' = type-something, 'c' = chat-about-this
             const current = ctx.state.attached.menuCursor ?? 0
             const delta = target - current
             const key = delta >= 0 ? 'Down' : 'Up'
@@ -122,7 +145,21 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 await tmux.sendSpecialKey(ctx.state.attached.session, key)
             }
             await tmux.sendEnter(ctx.state.attached.session)
+            ctx.state.attached.snapshotMessageId = null
             await ctx.tg.answerCallbackQuery(cb.id, `Selected option ${target + 1}`)
+            const opts = ctx.state.attached.lastPromptOptions
+            const picked = opts?.[target] ?? null
+            const display = special === 't'
+                ? '📝 Trả lời tự do'
+                : special === 'c'
+                    ? '💬 Bỏ menu, chat thường'
+                    : (picked?.label ?? `option ${target + 1}`)
+            await ctx.tg.sendMessage(ctx.chatId, `✅ Đã chọn: *${target + 1}.* ${display}`, { parse_mode: 'Markdown' })
+            if (special === 't') {
+                await ctx.tg.sendMessage(ctx.chatId, '📝 Giờ gõ câu trả lời tự do trong chat này, bridge sẽ chuyển vào Claude.')
+            } else if (special === 'c') {
+                await ctx.tg.sendMessage(ctx.chatId, '💬 Đã thoát menu. Cứ chat bình thường — tin nhắn sẽ vào Claude.')
+            }
         } else if (data.startsWith('key:')) {
             if (!ctx.state.attached) {
                 await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
@@ -130,6 +167,7 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
             }
             const key = data.slice(4)
             await tmux.sendSpecialKey(ctx.state.attached.session, key)
+            ctx.state.attached.snapshotMessageId = null
             await ctx.tg.answerCallbackQuery(cb.id, `Pressed ${key}`)
         } else if (data.startsWith('confirm:kill:')) {
             const name = data.slice(13)
