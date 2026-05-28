@@ -145,6 +145,10 @@ export async function runDaemon(): Promise<void> {
                     await sendApproveButtons(prompt.options)
                     log('info', 'snapshot', `sent approve buttons (${prompt.options.length})`)
                 }
+                if (bridgeState.attached) {
+                    bridgeState.attached.lastPromptOptions = prompt.options
+                    bridgeState.attached.lastPromptType = 'approve'
+                }
             } else if (prompt.type === 'menu') {
                 const key = 'm|' + prompt.options.map(o => `${o.index}:${o.label}:${o.selected ? '*' : ''}`).join('|')
                 if (key !== lastPromptKey) {
@@ -155,9 +159,15 @@ export async function runDaemon(): Promise<void> {
                 if (bridgeState.attached) {
                     const idx = prompt.options.findIndex(o => o.selected)
                     bridgeState.attached.menuCursor = idx < 0 ? 0 : idx
+                    bridgeState.attached.lastPromptOptions = prompt.options
+                    bridgeState.attached.lastPromptType = 'menu'
                 }
             } else {
                 lastPromptKey = null
+                if (bridgeState.attached) {
+                    bridgeState.attached.lastPromptOptions = null
+                    bridgeState.attached.lastPromptType = null
+                }
             }
         }
 
@@ -188,7 +198,11 @@ export async function runDaemon(): Promise<void> {
         stream.on('error', (e: Error) => log('warn', 'fifo', e.message))
         stream.on('end', () => log('info', 'fifo', `EOF on ${fifoPath}`))
 
-        bridgeState.attached = { session: sessionName, fifoPath, stream, streamer, menuCursor: 0, snapshotMessageId: null }
+        bridgeState.attached = {
+            session: sessionName, fifoPath, stream, streamer,
+            menuCursor: 0, snapshotMessageId: null,
+            lastPromptOptions: null, lastPromptType: null,
+        }
         state.attached_session = sessionName
         await saveState({ ...state, attached_session: sessionName })
         log('info', 'attach', `attached to ${sessionName}`)

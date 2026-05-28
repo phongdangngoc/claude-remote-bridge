@@ -43,7 +43,7 @@ function makeCtx(overrides: { thread_id?: number; attached?: boolean } = {}): { 
     const tg = makeFakeTg()
     const state: BridgeState = {
         attached: overrides.attached
-            ? { session: 's1', fifoPath: '/tmp/s1.fifo', stream: {} as never, streamer: {} as never, menuCursor: 0, snapshotMessageId: null }
+            ? { session: 's1', fifoPath: '/tmp/s1.fifo', stream: {} as never, streamer: {} as never, menuCursor: 0, snapshotMessageId: null, lastPromptOptions: null, lastPromptType: null }
             : null,
         startedAt: 0,
         lastFifoByteAt: 0,

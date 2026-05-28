@@ -4,6 +4,7 @@ import type { Streamer } from './streamer.js'
 import type { Config } from './config.js'
 import type { TelegramClient, TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from './telegram.js'
 import type { ReadStream } from 'fs'
+import type { Option } from './parser.js'
 
 export interface AttachedSession {
     session: string
@@ -15,6 +16,10 @@ export interface AttachedSession {
     // of editing the previous one. Set after each user input so each Q&A is
     // its own pinned-at-bottom message thread.
     snapshotMessageId: number | null
+    // Options shown in the most recent approve/menu button message, kept so
+    // the callback handler can echo back the chosen option's label.
+    lastPromptOptions: Option[] | null
+    lastPromptType: 'approve' | 'menu' | null
 }
 
 export interface BridgeState {
@@ -116,6 +121,14 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 await tmux.sendEnter(ctx.state.attached.session)
             }
             await ctx.tg.answerCallbackQuery(cb.id, `Sent: ${action}`)
+            const opts = ctx.state.attached.lastPromptOptions
+            const picked = action === 'no'
+                ? null
+                : (opts?.find(o => o.index === Number(action)) ?? null)
+            const label = picked
+                ? `*${picked.index}.* ${picked.label}`
+                : (action === 'no' ? '_no / abort_' : `option ${action}`)
+            await ctx.tg.sendMessage(ctx.chatId, `✅ Đã chọn: ${label}`, { parse_mode: 'Markdown' })
         } else if (data.startsWith('menu:')) {
             if (!ctx.state.attached) {
                 await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
@@ -132,6 +145,14 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
             }
             await tmux.sendEnter(ctx.state.attached.session)
             await ctx.tg.answerCallbackQuery(cb.id, `Selected option ${target + 1}`)
+            const opts = ctx.state.attached.lastPromptOptions
+            const picked = opts?.[target] ?? null
+            const display = special === 't'
+                ? '📝 Trả lời tự do'
+                : special === 'c'
+                    ? '💬 Bỏ menu, chat thường'
+                    : (picked?.label ?? `option ${target + 1}`)
+            await ctx.tg.sendMessage(ctx.chatId, `✅ Đã chọn: *${target + 1}.* ${display}`, { parse_mode: 'Markdown' })
             if (special === 't') {
                 await ctx.tg.sendMessage(ctx.chatId, '📝 Giờ gõ câu trả lời tự do trong chat này, bridge sẽ chuyển vào Claude.')
             } else if (special === 'c') {
