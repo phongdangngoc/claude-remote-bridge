@@ -26,7 +26,10 @@ export async function createFifo(fifoPath: string): Promise<void> {
 }
 
 export function openReadStream(fifoPath: string): fs.ReadStream {
-    const fd = fs.openSync(fifoPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK)
+    // O_RDWR on a FIFO: opens without blocking, and the kernel never reports
+    // EAGAIN/EOF on the read side while we hold the writer end ourselves —
+    // which prevents fs.ReadStream from self-destructing on initial read.
+    const fd = fs.openSync(fifoPath, fs.constants.O_RDWR)
     return fs.createReadStream('', { fd, autoClose: true, encoding: undefined })
 }
 
