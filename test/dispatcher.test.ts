@@ -101,6 +101,20 @@ function cb(opts: { fromId?: number; data?: string; thread_id?: number } = {}): 
     }
 }
 
+function photoMsg(opts: { fromId?: number; thread_id?: number } = {}): TelegramUpdate {
+    return {
+        update_id: 1,
+        message: {
+            message_id: 1,
+            from: { id: opts.fromId ?? 100, is_bot: false },
+            chat: { id: 100, type: 'private' },
+            date: 0,
+            photo: [{ file_id: 'P1', file_unique_id: 'u1', width: 100, height: 100 }],
+            message_thread_id: opts.thread_id,
+        } as unknown as TelegramMessage,
+    }
+}
+
 test('dispatcher: drops messages from disallowed users (no reply)', async () => {
     const { ctx, tg } = makeCtx()
     await routeUpdate(msg({ fromId: 999, text: '/help' }), ctx)
@@ -213,4 +227,11 @@ test('dispatcher: /kill Cancel button → "Cancelled" (not "Unknown action")', a
     const { ctx, tg } = makeCtx()
     await routeUpdate(cb({ data: 'cancel' }), ctx)
     assert.equal(tg.answers[0].text, 'Cancelled')
+})
+
+test('dispatcher: photo while not attached → "Chưa attach" warning', async () => {
+    const { ctx, tg } = makeCtx()
+    await routeUpdate(photoMsg(), ctx)
+    assert.equal(tg.sends.length, 1)
+    assert.match(tg.sends[0].text, /Chưa attach/)
 })
