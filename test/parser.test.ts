@@ -41,6 +41,15 @@ test('detectPrompt: multi-choice menu', async () => {
     assert.equal(result.options[0].selected, true)
 })
 
+test('detectPrompt: numbered Claude Code menu', () => {
+    const text = 'Pick an animal:\n\n❯ 1. Ngựa\n  2. Hươu cao cổ\n  3. Ngựa vằn\n'
+    const result = expectOptions(detectPrompt(text), 'menu')
+    assert.equal(result.options.length, 3)
+    assert.equal(result.options[0].label, 'Ngựa')
+    assert.equal(result.options[0].selected, true)
+    assert.equal(result.options[2].label, 'Ngựa vằn')
+})
+
 test('detectPrompt: free text (no cursor)', () => {
     const result = detectPrompt('Just some output\nNo prompt here.\n')
     assert.equal(result.type, 'free')
@@ -49,4 +58,14 @@ test('detectPrompt: free text (no cursor)', () => {
 test('detectPrompt: cursor but no menu structure', () => {
     const result = detectPrompt('> some text without a real menu\n')
     assert.equal(result.type, 'free')
+})
+
+test('detectPrompt: prose numbered list is NOT a menu (no ❯ pointer)', () => {
+    const text = 'Here is the plan:\n1. Install deps\n2. Build the project\n3. Run the daemon\n'
+    assert.equal(detectPrompt(text).type, 'free')
+})
+
+test('detectPrompt: blockquoted numbered list is NOT a prompt (> is not a strong cursor)', () => {
+    const text = 'You asked me to:\n> 1. yes do the install\n> 2. no\nShould I proceed?\n'
+    assert.equal(detectPrompt(text).type, 'free')
 })
