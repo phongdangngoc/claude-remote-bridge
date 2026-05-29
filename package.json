@@ -12,7 +12,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node dist/test/_runner.js dist/test/parser.test.js dist/test/streamer.test.js dist/test/dispatcher.test.js dist/test/daemon.test.js dist/test/telegram.test.js",
+    "test": "tsc && node dist/test/_runner.js dist/test/parser.test.js dist/test/streamer.test.js dist/test/dispatcher.test.js dist/test/daemon.test.js dist/test/telegram.test.js dist/test/attachments.test.js",
     "start": "node dist/bridge.js daemon"
   },
   "dependencies": {},

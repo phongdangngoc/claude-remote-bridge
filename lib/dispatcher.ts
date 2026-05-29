@@ -1,6 +1,8 @@
 import * as tmux from './tmux.js'
 import { errMsg } from './errors.js'
 import { escapeHtml } from './telegram.js'
+import { pickAttachment, saveAttachment } from './attachments.js'
+import type { PickedAttachment } from './attachments.js'
 import type { Streamer } from './streamer.js'
 import type { Config } from './config.js'
 import type { TelegramClient, TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from './telegram.js'
@@ -81,6 +83,11 @@ async function routeMessage(msg: TelegramMessage, ctx: Ctx): Promise<void> {
     if (!msg.from) return
     if (!isAllowed(msg.from.id, ctx)) return
     if (!isCorrectThread(msg, ctx)) return
+    const attachment = pickAttachment(msg)
+    if (attachment) {
+        await handleAttachment(attachment, ctx)
+        return
+    }
     const text = (msg.text ?? '').trim()
     if (!text) return
 
@@ -100,6 +107,35 @@ async function routeMessage(msg: TelegramMessage, ctx: Ctx): Promise<void> {
         ctx.state.attached.snapshotMessageId = null
     } catch (e) {
         await ctx.tg.sendMessage(ctx.chatId, `❌ send-keys failed: ${errMsg(e)}`)
+    }
+}
+
+// Download a photo/document the user sent into the attached session's cwd and
+// reply with the saved path. Does not type anything into the Claude TUI — the
+// user references the path when they want Claude to look at it.
+async function handleAttachment(att: PickedAttachment, ctx: Ctx): Promise<void> {
+    if (!ctx.state.attached) {
+        await ctx.tg.sendMessage(ctx.chatId, '⚠️ Chưa attach session nào — không biết lưu vào đâu. Dùng `/attach` trước.')
+        return
+    }
+    if (att.fileSize && att.fileSize > 20 * 1024 * 1024) {
+        await ctx.tg.sendMessage(ctx.chatId, '❌ File quá lớn (>20MB) — Telegram bot không tải được.')
+        return
+    }
+    const session = ctx.state.attached.session
+    let cwd: string
+    try {
+        cwd = await tmux.paneCwd(session)
+    } catch (e) {
+        await ctx.tg.sendMessage(ctx.chatId, `❌ Không lấy được thư mục làm việc: ${errMsg(e)}`)
+        return
+    }
+    try {
+        const { relPath, bytes } = await saveAttachment(ctx.tg, att.fileId, att.suggestedName, cwd)
+        const kb = (bytes / 1024).toFixed(1)
+        await ctx.tg.sendMessage(ctx.chatId, `📎 Đã lưu \`${relPath}\` (${kb} KB). Tham chiếu path này cho Claude khi cần.`)
+    } catch (e) {
+        await ctx.tg.sendMessage(ctx.chatId, `❌ Lưu file thất bại: ${errMsg(e)}`)
     }
 }
 

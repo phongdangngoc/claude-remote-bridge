@@ -22,6 +22,32 @@ export interface TelegramMessage {
     text?: string
     date: number
     message_thread_id?: number
+    photo?: PhotoSize[]
+    document?: Document
+    caption?: string
+}
+
+export interface PhotoSize {
+    file_id: string
+    file_unique_id: string
+    width: number
+    height: number
+    file_size?: number
+}
+
+export interface Document {
+    file_id: string
+    file_unique_id: string
+    file_name?: string
+    mime_type?: string
+    file_size?: number
+}
+
+export interface TelegramFile {
+    file_id: string
+    file_unique_id: string
+    file_size?: number
+    file_path?: string
 }
 
 export interface TelegramCallbackQuery {
@@ -107,6 +133,31 @@ function request<T>(token: string, method: string, payload: Record<string, unkno
     })
 }
 
+// Binary GET against the file endpoint. Unlike request() (which POSTs JSON to
+// /bot<token>/<method>), Telegram file downloads are a GET on a different path
+// and return raw bytes.
+function requestBinary(token: string, filePath: string, timeoutMs = 60000): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            method: 'GET',
+            hostname: HOST,
+            path: `/file/bot${token}/${filePath}`,
+            timeout: timeoutMs,
+        }, (res) => {
+            const status = res.statusCode ?? 0
+            const chunks: Buffer[] = []
+            res.on('data', (c: Buffer) => chunks.push(c))
+            res.on('end', () => {
+                if (status >= 200 && status < 300) resolve(Buffer.concat(chunks))
+                else reject(new Error(`file download HTTP ${status}`))
+            })
+        })
+        req.on('error', reject)
+        req.on('timeout', () => { req.destroy(new Error('telegram file download timeout')) })
+        req.end()
+    })
+}
+
 export class TelegramClient {
     private token: string
     private defaultThreadId: number | null
@@ -170,6 +221,14 @@ export class TelegramClient {
 
     getMe(): Promise<TelegramUser> {
         return request<TelegramUser>(this.token, 'getMe', {}, 10000)
+    }
+
+    getFile(fileId: string): Promise<TelegramFile> {
+        return request<TelegramFile>(this.token, 'getFile', { file_id: fileId }, 10000)
+    }
+
+    downloadFile(filePath: string): Promise<Buffer> {
+        return requestBinary(this.token, filePath)
     }
 }
 
