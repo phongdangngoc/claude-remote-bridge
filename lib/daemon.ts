@@ -1,6 +1,6 @@
 import path from 'path'
 import { spawn } from 'child_process'
-import { TelegramClient, isRateLimit, isInvalidToken, TelegramError } from './telegram.js'
+import { TelegramClient, isRateLimit, isInvalidToken, isNotModified, isTooOldToEdit, escapeHtml, TelegramError } from './telegram.js'
 import * as tmux from './tmux.js'
 import * as fifo from './fifo.js'
 import { Streamer, Sink } from './streamer.js'
@@ -82,6 +82,19 @@ export function trimToLatestTurn(text: string): string {
     return sliced.slice(0, endIdx).join('\n')
 }
 
+// Collapse a trimmed turn into the form shown in chat: strip trailing spaces,
+// squeeze blank runs, drop leading/trailing blank lines.
+export function cleanTurn(captured: string): string {
+    return trimToLatestTurn(captured)
+        .replace(/[ \t]+$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/^\n+|\n+$/g, '')
+}
+
+// How many lines at the bottom of a capture count as the status/input
+// region — where Claude Code's spinner and "esc to interrupt" hint render.
+const STATUS_REGION_LINES = 12
+
 // Did the pane reach an input boundary? "Settled" means Claude has yielded
 // control back to the user — either by finishing a response (idle prompt)
 // or by surfacing an approve/menu prompt. The empty `❯` cursor at the
@@ -89,15 +102,23 @@ export function trimToLatestTurn(text: string): string {
 // respond, so we also require the absence of an active spinner status AND
 // the presence of a Claude-emitted content indicator (response bullet or
 // tool-call glyph) between the user's last input line and the footer.
-function paneIsSettled(captured: string, prompt: PromptResult): boolean {
+export function paneIsSettled(captured: string, prompt: PromptResult): boolean {
     if (prompt.type === 'approve' || prompt.type === 'menu') return true
 
-    // Active gerund status ("Cooking for 3s", "Thinking for 5s", …) and the
-    // animated braille spinner both signal Claude is still generating.
-    if (/\b\w+ing\s+for\s+\d+\s*s\b/i.test(captured)) return false
-    if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠟⠷⠿]/.test(captured)) return false
-
+    // "Still generating" signals live only in the bottom status/input region.
+    // Scoping the scan there (rather than the whole capture) stops innocuous
+    // response *content* — e.g. the literal words "ran for 5 s" or a stray
+    // braille glyph in a code block — from wedging the turn as never-settled.
     const lines = captured.split('\n')
+    const statusRegion = lines.slice(-STATUS_REGION_LINES).join('\n')
+    //   • "esc to interrupt" is Claude Code's most reliable in-progress marker
+    //   • ✶✻✽… / braille ⠋⠙… are spinner frames
+    // Deliberately NOT matching gerund-plus-timer text ("waiting for 30 s"):
+    // that phrasing appears in ordinary answers and used to wedge the turn as
+    // permanently unsettled.
+    if (/esc to interrupt/i.test(statusRegion)) return false
+    if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠟⠷⠿✶✻✽✳✺✷✦]/.test(statusRegion)) return false
+
     let searchEnd = lines.length
     for (let i = 0; i < lines.length; i++) {
         if (/Session:\s+[0-9a-f-]{8,}/i.test(lines[i])) { searchEnd = i; break }
@@ -178,7 +199,16 @@ export async function runDaemon(): Promise<void> {
         await fifo.createFifo(fifoPath)
         // Open read stream BEFORE pipe-pane (so cat doesn't block on open)
         const stream = fifo.openReadStream(fifoPath)
-        await tmux.pipePaneStart(sessionName, `cat > ${JSON.stringify(fifoPath)}`)
+        try {
+            await tmux.pipePaneStart(sessionName, `cat > ${JSON.stringify(fifoPath)}`)
+        } catch (e) {
+            // pipe-pane failed: tear down the half-open attachment so the
+            // O_RDWR fd and the FIFO file don't leak. bridgeState.attached
+            // isn't set yet, so detach() can't reclaim them.
+            stream.destroy()
+            await fifo.unlinkFifo(fifoPath).catch(() => {})
+            throw e
+        }
 
         // Cache cwd at attach time. Header on every new send re-queries the
         // git branch (cheap) but reuses the cached cwd.
@@ -194,6 +224,21 @@ export async function runDaemon(): Promise<void> {
         // No edits — each turn produces exactly one persistent message in
         // chat history, so scrolling back gives a clean transcript.
         let lastPromptKey: string | null = null
+        // Body currently shown in the per-turn snapshot message, and the last
+        // body that Telegram rejected — so a second settle in the same turn
+        // edits in place (instead of dropping later output), and a payload the
+        // API keeps refusing isn't re-POSTed every silence tick.
+        let lastSnapshotBody: string | null = null
+        let lastFailedBody: string | null = null
+        // Turn already on screen at attach time. After a daemon restart the
+        // pane is usually already settled; suppress re-posting that exact turn
+        // (the user saw it before the restart) until something new appears.
+        let initialCleaned: string | null = null
+        try {
+            const at = await tmux.capturePane(sessionName, { lines: config.snapshot_lines })
+            const c = cleanTurn(at)
+            if (c && paneIsSettled(at, detectPrompt(c))) initialCleaned = c
+        } catch { /* best effort */ }
         const getSnapId = (): number | null => bridgeState.attached?.snapshotMessageId ?? null
         const setSnapId = (id: number | null): void => {
             if (bridgeState.attached) bridgeState.attached.snapshotMessageId = id
@@ -207,32 +252,72 @@ export async function runDaemon(): Promise<void> {
                 log('warn', 'snapshot', `capturePane failed: ${errMsg(e)}`)
                 return
             }
-            const trimmedTurn = trimToLatestTurn(captured)
-            const cleaned = trimmedTurn.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '')
+            const cleaned = cleanTurn(captured)
             const prompt = detectPrompt(cleaned)
 
-            // Only send once Claude has reached an input boundary. Mid-thought
+            // Only act once Claude has reached an input boundary. Mid-thought
             // pauses (Claude waiting on its own API call) shouldn't produce
             // intermediate snapshots — wait for the real settle.
             const settled = paneIsSettled(captured, prompt)
-            if (settled && cleaned && getSnapId() == null) {
+            if (settled && cleaned) {
                 let header = ''
                 try { header = await buildHeader(sessionName, cachedCwd) } catch {}
-                const max = config.max_message_chars
+                // Reserve headroom so header + code fence + truncation marker
+                // can't push the message past Telegram's 4096-char hard cap.
+                const HARD_LIMIT = 4096
+                const reserve = header.length + 32
+                const max = Math.max(256, Math.min(config.max_message_chars, HARD_LIMIT - reserve))
                 const trimmed = cleaned.length > max ? '[…truncated…]\n' + cleaned.slice(-max) : cleaned
                 const fenced = '```\n' + trimmed.replace(/```/g, '``​`') + '\n```'
                 const body = header ? `${header}\n${fenced}` : fenced
-                try {
-                    const msg = await tg.sendMessage(config.chat_id, body)
-                    setSnapId(msg.message_id)
-                    // Buttons (if any) belong to a fresh message — let
-                    // detectPrompt re-emit them under it.
-                    lastPromptKey = null
-                    log('info', 'snapshot', `sendNew msgId=${msg.message_id} bodyLen=${body.length}`)
-                } catch (e) {
-                    log('warn', 'telegram', errMsg(e))
+
+                const id = getSnapId()
+                if (id == null) {
+                    // First settle of the turn → fresh message. Skip the turn
+                    // already on screen at attach time, and any body the API has
+                    // already rejected (don't hammer it).
+                    if (cleaned === initialCleaned) {
+                        // already shown before restart — nothing new yet
+                    } else if (body !== lastFailedBody) {
+                        try {
+                            const msg = await tg.sendMessage(config.chat_id, body)
+                            setSnapId(msg.message_id)
+                            lastSnapshotBody = body
+                            lastFailedBody = null
+                            initialCleaned = null
+                            // Buttons (if any) belong under the fresh message.
+                            lastPromptKey = null
+                            log('info', 'snapshot', `sendNew msgId=${msg.message_id} bodyLen=${body.length}`)
+                        } catch (e) {
+                            lastFailedBody = body
+                            log('warn', 'telegram', errMsg(e))
+                        }
+                    }
+                } else if (body !== lastSnapshotBody) {
+                    // Same turn, new content (tool output, the final answer) —
+                    // edit the persistent message in place so nothing is lost.
+                    lastSnapshotBody = body
+                    try {
+                        await tg.editMessageText(config.chat_id, id, body)
+                        log('info', 'snapshot', `edit msgId=${id} bodyLen=${body.length}`)
+                    } catch (e) {
+                        if (isNotModified(e)) {
+                            // no-op
+                        } else if (isTooOldToEdit(e)) {
+                            try {
+                                const msg = await tg.sendMessage(config.chat_id, body)
+                                setSnapId(msg.message_id)
+                                lastPromptKey = null
+                            } catch (e2) { log('warn', 'telegram', errMsg(e2)) }
+                        } else {
+                            log('warn', 'telegram', errMsg(e))
+                        }
+                    }
                 }
             }
+
+            // Buttons + prompt state only matter at a genuine input boundary.
+            if (!settled) return
             if (prompt.type === 'approve') {
                 const key = 'a|' + prompt.options.map(o => `${o.index}:${o.label}`).join('|')
                 if (key !== lastPromptKey) {
@@ -317,14 +402,14 @@ export async function runDaemon(): Promise<void> {
     }
 
     async function sendApproveButtons(options: Option[]): Promise<void> {
-        const lines = ['👇 *Approve prompt:*', '']
-        options.forEach((o, i) => lines.push(`*${i + 1}.* ${o.label}`))
+        const lines = ['👇 <b>Approve prompt:</b>', '']
+        options.forEach((o, i) => lines.push(`<b>${i + 1}.</b> ${escapeHtml(o.label)}`))
         const inline = options.map((o, i) => ({
             text: String(i + 1),
             callback_data: `approve:${o.index}`,
         }))
         await tg.sendMessage(config.chat_id, lines.join('\n'), {
-            parse_mode: 'Markdown',
+            parse_mode: 'HTML',
             reply_markup: { inline_keyboard: [inline] },
         })
     }
@@ -340,10 +425,10 @@ export async function runDaemon(): Promise<void> {
             return { kind: null, display: label }
         }
         const limited = options.slice(0, 8)
-        const lines = ['👇 *Choose an option:*', '']
+        const lines = ['👇 <b>Choose an option:</b>', '']
         limited.forEach((o, i) => {
             const s = specialize(o.label)
-            lines.push(`*${i + 1}.* ${s.display}`)
+            lines.push(`<b>${i + 1}.</b> ${escapeHtml(s.display)}`)
         })
         const buttons = limited.map((o, i) => {
             const s = specialize(o.label)
@@ -355,7 +440,7 @@ export async function runDaemon(): Promise<void> {
         const rows: typeof buttons[] = []
         for (let i = 0; i < buttons.length; i += 4) rows.push(buttons.slice(i, i + 4))
         await tg.sendMessage(config.chat_id, lines.join('\n'), {
-            parse_mode: 'Markdown',
+            parse_mode: 'HTML',
             reply_markup: { inline_keyboard: rows },
         })
     }

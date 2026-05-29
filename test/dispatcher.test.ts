@@ -205,6 +205,12 @@ test('dispatcher: key callback without attach → "Not attached"', async () => {
 
 test('dispatcher: unknown callback data → "Unknown action"', async () => {
     const { ctx, tg } = makeCtx()
-    await routeUpdate(cb({ data: 'cancel' }), ctx)
+    await routeUpdate(cb({ data: 'bogus:xyz' }), ctx)
     assert.equal(tg.answers[0].text, 'Unknown action')
+})
+
+test('dispatcher: /kill Cancel button → "Cancelled" (not "Unknown action")', async () => {
+    const { ctx, tg } = makeCtx()
+    await routeUpdate(cb({ data: 'cancel' }), ctx)
+    assert.equal(tg.answers[0].text, 'Cancelled')
 })

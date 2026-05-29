@@ -1,5 +1,6 @@
 import * as tmux from './tmux.js'
 import { errMsg } from './errors.js'
+import { escapeHtml } from './telegram.js'
 import type { Streamer } from './streamer.js'
 import type { Config } from './config.js'
 import type { TelegramClient, TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from './telegram.js'
@@ -37,6 +38,17 @@ export interface Ctx {
     attach(name: string): Promise<void>
     detach(): Promise<void>
     sendStatus(): Promise<void>
+}
+
+// Best-effort confirmation line, always HTML so Claude-derived labels can be
+// escaped safely. The action has already been delivered and the callback
+// already answered by the time we echo, so a parse/format failure here must
+// NOT bubble into routeCallback's outer catch — that would re-answer the
+// callback and surface a misleading "Error" toast for an action that worked.
+async function echo(ctx: Ctx, html: string): Promise<void> {
+    try {
+        await ctx.tg.sendMessage(ctx.chatId, html, { parse_mode: 'HTML' })
+    } catch { /* confirmation is non-critical */ }
 }
 
 export async function routeUpdate(update: TelegramUpdate, ctx: Ctx): Promise<void> {
@@ -127,9 +139,9 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 ? null
                 : (opts?.find(o => o.index === Number(action)) ?? null)
             const label = picked
-                ? `*${picked.index}.* ${picked.label}`
-                : (action === 'no' ? '_no / abort_' : `option ${action}`)
-            await ctx.tg.sendMessage(ctx.chatId, `✅ Đã chọn: ${label}`, { parse_mode: 'Markdown' })
+                ? `<b>${picked.index}.</b> ${escapeHtml(picked.label)}`
+                : (action === 'no' ? '<i>no / abort</i>' : `option ${escapeHtml(action)}`)
+            await echo(ctx, `✅ Đã chọn: ${label}`)
         } else if (data.startsWith('menu:')) {
             if (!ctx.state.attached) {
                 await ctx.tg.answerCallbackQuery(cb.id, 'Not attached')
@@ -138,6 +150,10 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
             const parts = data.slice(5).split(':')
             const target = Number(parts[0])
             const special = parts[1] // 't' = type-something, 'c' = chat-about-this
+            if (!Number.isInteger(target) || target < 0) {
+                await ctx.tg.answerCallbackQuery(cb.id, 'Bad option')
+                return
+            }
             const current = ctx.state.attached.menuCursor ?? 0
             const delta = target - current
             const key = delta >= 0 ? 'Down' : 'Up'
@@ -145,6 +161,10 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 await tmux.sendSpecialKey(ctx.state.attached.session, key)
             }
             await tmux.sendEnter(ctx.state.attached.session)
+            // Track where the TUI cursor now sits so a second tap arriving
+            // before the next snapshot computes its delta from here, not the
+            // stale pre-navigation position.
+            ctx.state.attached.menuCursor = target
             ctx.state.attached.snapshotMessageId = null
             await ctx.tg.answerCallbackQuery(cb.id, `Selected option ${target + 1}`)
             const opts = ctx.state.attached.lastPromptOptions
@@ -153,12 +173,12 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
                 ? '📝 Trả lời tự do'
                 : special === 'c'
                     ? '💬 Bỏ menu, chat thường'
-                    : (picked?.label ?? `option ${target + 1}`)
-            await ctx.tg.sendMessage(ctx.chatId, `✅ Đã chọn: *${target + 1}.* ${display}`, { parse_mode: 'Markdown' })
+                    : escapeHtml(picked?.label ?? `option ${target + 1}`)
+            await echo(ctx, `✅ Đã chọn: <b>${target + 1}.</b> ${display}`)
             if (special === 't') {
-                await ctx.tg.sendMessage(ctx.chatId, '📝 Giờ gõ câu trả lời tự do trong chat này, bridge sẽ chuyển vào Claude.')
+                await echo(ctx, '📝 Giờ gõ câu trả lời tự do trong chat này, bridge sẽ chuyển vào Claude.')
             } else if (special === 'c') {
-                await ctx.tg.sendMessage(ctx.chatId, '💬 Đã thoát menu. Cứ chat bình thường — tin nhắn sẽ vào Claude.')
+                await echo(ctx, '💬 Đã thoát menu. Cứ chat bình thường — tin nhắn sẽ vào Claude.')
             }
         } else if (data.startsWith('key:')) {
             if (!ctx.state.attached) {
@@ -174,6 +194,8 @@ async function routeCallback(cb: TelegramCallbackQuery, ctx: Ctx): Promise<void>
             await tmux.killSession(name)
             await ctx.tg.answerCallbackQuery(cb.id, `Killed ${name}`)
             await ctx.tg.sendMessage(ctx.chatId, `💀 Killed session \`${name}\``)
+        } else if (data === 'cancel') {
+            await ctx.tg.answerCallbackQuery(cb.id, 'Cancelled')
         } else {
             await ctx.tg.answerCallbackQuery(cb.id, 'Unknown action')
         }

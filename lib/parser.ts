@@ -18,6 +18,12 @@ function buildCursorPattern(): RegExp {
 
 const CURSOR_RE = buildCursorPattern()
 
+// The literal selection pointer Claude Code renders on the active row of an
+// approve/menu prompt. Excludes '>' on purpose: a bare '>' is far too common
+// (markdown blockquotes, "->" arrows, shell/diff output) and was turning
+// ordinary prose — especially trailing numbered lists — into phantom menus.
+const STRONG_CURSOR_RE = /[❯►]/
+
 export interface Option {
     index: number
     label: string
@@ -59,7 +65,7 @@ function extractMenuOptions(text: string): Option[] {
     const hits: Array<{ label: string; num: number; selected: boolean }> = []
     for (const line of lines) {
         const m = numberedRe.exec(line)
-        if (m) hits.push({ label: m[3], num: Number(m[2]), selected: CURSOR_RE.test(m[1]) })
+        if (m) hits.push({ label: m[3], num: Number(m[2]), selected: STRONG_CURSOR_RE.test(m[1]) })
     }
     if (hits.length >= 2) {
         const tail = [hits[hits.length - 1]]
@@ -67,7 +73,10 @@ function extractMenuOptions(text: string): Option[] {
             if (hits[i].num === tail[0].num - 1) tail.unshift(hits[i])
             else break
         }
-        if (tail.length >= 2 && tail[0].num === 1) {
+        // A real Claude Code menu always points at one row with ❯; require that
+        // pointer so a plain "1. … 2. …" list in the response isn't mistaken
+        // for a selectable menu.
+        if (tail.length >= 2 && tail[0].num === 1 && tail.some(h => h.selected)) {
             return tail.map((h, i) => ({ index: i, label: h.label, selected: h.selected }))
         }
     }
@@ -87,23 +96,25 @@ function extractMenuOptions(text: string): Option[] {
 }
 
 export function detectPrompt(plainText: string): PromptResult {
-    const last20 = lastN(plainText, 40)
-    const hasCursor = CURSOR_RE.test(last20)
+    const recent = lastN(plainText, 40)
+    // Only the strong selection pointer (❯/►) opens the prompt path — a bare
+    // '>' is too common in normal output to be a reliable signal.
+    const hasCursor = STRONG_CURSOR_RE.test(recent)
 
     if (!hasCursor) return { type: 'free' }
 
-    const numbered = extractNumberedOptions(last20)
+    const numbered = extractNumberedOptions(recent)
     const looksLikeApprove =
         numbered.length >= 2 &&
         numbered.length <= 5 &&
         /yes/i.test(numbered[0]?.label ?? '') &&
-        (/proceed|approve|allow|do you want/i.test(last20))
+        (/proceed|approve|allow|do you want/i.test(recent))
 
     if (looksLikeApprove) {
         return { type: 'approve', options: numbered }
     }
 
-    const menuOpts = extractMenuOptions(last20)
+    const menuOpts = extractMenuOptions(recent)
     if (menuOpts.length >= 2) {
         return { type: 'menu', options: menuOpts }
     }

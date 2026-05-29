@@ -173,6 +173,15 @@ export class TelegramClient {
     }
 }
 
+// Escape text for parse_mode:'HTML'. Telegram's legacy 'Markdown' has no
+// reliable escaping, so any message that interpolates Claude-derived text
+// (option labels, file paths, commands) must go out as HTML with the three
+// reserved characters escaped — otherwise an unbalanced * _ ` [ makes the
+// Bot API reject the whole send with HTTP 400 and the buttons never appear.
+export function escapeHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 function isErr(err: unknown): err is TelegramError {
     return err instanceof Error && typeof (err as TelegramError).code === 'number'
 }
